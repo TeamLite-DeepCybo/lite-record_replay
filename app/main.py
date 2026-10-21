@@ -69,7 +69,7 @@ UI_FAMILIES = (
 )
 MONO_FAMILIES = ("Noto Sans Mono CJK SC", "DejaVu Sans Mono", "Noto Sans CJK SC")
 
-VERSION = "2.0.0"
+VERSION = "2.0.5"
 ROOT_DIR = Path(__file__).resolve().parent
 ASSETS = ROOT_DIR / "assets"
 
