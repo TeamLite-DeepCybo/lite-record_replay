@@ -8,15 +8,17 @@ from __future__ import annotations
 
 import re
 import subprocess
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from robstride_dynamics import RobstrideBus
+import can
 
-from . import config
+from . import config, paths
+from .bus import ArmBus
 from .util import quiet
 
-ROOT = Path(__file__).resolve().parent.parent
+ROOT = paths.app_root()   # 打包成 exe 后是 exe 所在目录
 
 
 class DetectError(RuntimeError):
@@ -31,6 +33,7 @@ class Setup:
     mapping: dict[str, str]  # 侧 -> CAN 口
     online: dict[str, set[int]] = field(default_factory=dict)  # 侧 -> 在线电机 ID
     expected: list[str] = field(default_factory=list)  # 按所选机型"应该"有的关节
+    interface: dict[str, str] = field(default_factory=dict)  # 总线标签 -> CAN 驱动名
 
     @property
     def motor_names(self) -> list[str]:
@@ -151,16 +154,33 @@ def bring_up_can(on_progress=None, channels=None) -> tuple[bool, str]:
     return result.returncode == 0, output
 
 
-def ensure_can(channels=None, on_progress=None):
-    """确保 CAN 口可用：发现没启动就自动跑一次 canup.sh。返回 (是否可用, 提示信息)。"""
-    targets = list(channels or config.CANDIDATE_CHANNELS)
+def ensure_can(channels=None, on_progress=None, interface: str | None = None):
+    """确保 CAN 总线可用。返回 (是否可用, 提示信息)。
+
+    Linux 上会检查并在需要时执行 canup.sh；Windows / macOS 上不需要这一步，
+    只确认 python-can 能枚举到适配器（驱动是否装好）。
+    """
     say = on_progress or (lambda text: None)
+
+    if not sys.platform.startswith("linux"):
+        targets = list_targets(interface)
+        if not targets:
+            driver = (interface or "auto").strip()
+            hint = f"（当前指定驱动：{driver}）" if driver and driver != "auto" else ""
+            return False, [
+                f"没有检测到可用的 CAN 适配器{hint}",
+                "请确认：USB-CAN 已插好、厂商驱动已安装；"
+                "也可用 --interface 指定驱动（pcan / canalystii / slcan / gs_usb / kvaser …）",
+            ]
+        say("检测到 CAN 适配器：" + "，".join(label for label, _, _ in targets))
+        return True, []
+
+    targets = list(dict.fromkeys(channels or config.CANDIDATE_CHANNELS))
 
     def survey() -> dict[str, str]:
         return {channel: _can_problem(channel) for channel in targets}
 
     problems = survey()
-    # "不存在"是正常的（比如只接了 can0/can1），不算需要处理的麻烦
     actionable = {ch: why for ch, why in problems.items() if why and why != "不存在"}
 
     if actionable:
@@ -177,7 +197,7 @@ def ensure_can(channels=None, on_progress=None):
     remaining = [f"{ch} {why}" for ch, why in problems.items() if why and why != "不存在"]
 
     if not any(can_status(channel)["state"] == "up" for channel in targets):
-        return False, ["没有可用的 CAN 口，请手动执行：bash canup.sh"] + remaining
+        return False, ["没有可用的 CAN 口，请手动执行：bash app/canup.sh"] + remaining
 
     return True, remaining
 
@@ -185,11 +205,11 @@ def ensure_can(channels=None, on_progress=None):
 # ----------------------------------------------------------------------
 # 电机扫描
 # ----------------------------------------------------------------------
-def _probe(channel: str, ids: list[int], timeout: float) -> set[int]:
+def _probe(channel: str, ids: list[int], timeout: float, interface: str = "socketcan") -> set[int]:
     """ping 一个通道上的若干 ID，返回真正响应的 ID。"""
     try:
         with quiet():  # 构造和 connect 都会往 stdout 打无关信息
-            bus = RobstrideBus(channel=channel, motors={})
+            bus = ArmBus(channel=channel, motors={}, interface=interface)
             bus.connect(handshake=False)
     except Exception:
         return set()  # 该 CAN 口不存在 / 打不开
@@ -216,6 +236,52 @@ def _probe(channel: str, ids: list[int], timeout: float) -> set[int]:
     return found
 
 
+def list_targets(interface: str | None = None) -> list[tuple[str, str, str]]:
+    """列出可用的 CAN 总线，返回 [(标签, 通道, 驱动)]。
+
+    - Linux：走 socketcan，标签就是 can0 / can1 …
+    - Windows / macOS：问 python-can 有哪些硬件适配器
+      （pcan / canalystii / slcan / gs_usb / kvaser / vector …）
+    """
+    wanted = (interface or "auto").strip()
+    explicit = wanted.lower() not in ("", "auto")
+
+    # Linux 上 socketcan 直接用固定候选口（这样还能顺便查 ip link 状态）
+    if sys.platform.startswith("linux") and wanted.lower() in ("", "auto", "socketcan"):
+        return [(ch, ch, "socketcan") for ch in config.CANDIDATE_CHANNELS]
+
+    drivers = [wanted] if explicit else None
+    try:
+        with quiet():   # 枚举会尝试加载所有驱动，往 stderr 刷一堆"不可用"的警告
+            found = (
+                can.detect_available_configs(interfaces=drivers)
+                if drivers
+                else can.detect_available_configs()
+            )
+    except Exception:
+        found = []
+
+    targets: list[tuple[str, str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for item in found or []:
+        driver = str(item.get("interface", "")).lower()
+        channel = item.get("channel")
+        if not driver or channel is None:
+            continue
+        if driver in config.VIRTUAL_CAN_DRIVERS:
+            continue
+        if driver == "socketcan":
+            label = str(channel)
+        else:
+            label = f"{channel} ({driver})"
+        key = (label, driver)
+        if key in seen:
+            continue
+        seen.add(key)
+        targets.append((label, str(channel), driver))
+    return targets
+
+
 def parse_channels(spec: str) -> dict[str, str]:
     """把 --channels can2,can1 解析成 {"left": "can2", "right": "can1"}。
 
@@ -236,23 +302,38 @@ def scan(
     *,
     forced: dict[str, str] | None = None,
     expect: str | None = None,
+    interface: str | None = None,
     timeout: float = 0.04,
     on_progress=None,
 ) -> Setup:
     """扫描总线并给出可直接交给 Arm 的配置。
 
-    forced 不为空时用它指定左右臂的 CAN 口（仍会扫描，只把没响应的电机剔除）。
-    expect 是机器人类型（"gripper" / "no_gripper" / None）：
-    只会保留该机型应有的关节，缺的记在 Setup.missing 里。
+    forced 不为空时用它指定左右臂的通道（仍会扫描，只把没响应的电机剔除）。
+    expect 是机器人类型（"gripper" / "no_gripper" / None）。
+    interface 是 CAN 驱动（Linux 默认 socketcan；Windows 见 list_targets）。
     """
     say = on_progress or (lambda text: None)
 
+    available = list_targets(interface)
+    by_label = {label: (label, channel, driver) for label, channel, driver in available}
+
     if forced:
         mapping = dict(forced)
-        channels = list(dict.fromkeys(mapping.values()))  # 去重且保序
+        targets = []
+        for label in dict.fromkeys(mapping.values()):
+            targets.append(by_label.get(label) or (label, label, config.default_can_interface()))
     else:
+        if candidates:
+            targets = [by_label.get(name) or (name, name, config.default_can_interface()) for name in candidates]
+        else:
+            targets = available
         mapping = {}
-        channels = list(candidates or config.CANDIDATE_CHANNELS)
+
+    if not targets:
+        raise DetectError(
+            "没有可用的 CAN 总线。Linux 请确认已执行 bash app/canup.sh；"
+            "Windows 请确认 USB-CAN 适配器驱动已安装，或用 --interface 指定驱动。"
+        )
 
     id_of_side = {
         side: [spec.can_id for spec in config.MOTORS if spec.side == side] for side in config.SIDES
@@ -260,27 +341,29 @@ def scan(
     probe_ids = sorted({can_id for ids in id_of_side.values() for can_id in ids})
 
     hits: dict[str, set[int]] = {}
-    for channel in channels:
-        say(f"扫描 {channel} ...")
-        hits[channel] = _probe(channel, probe_ids, timeout)
-        if hits[channel]:
-            say(f"  {channel} 上发现 {len(hits[channel])} 个电机：{sorted(hits[channel])}")
+    drivers: dict[str, str] = {}
+    for label, channel, driver in targets:
+        say(f"扫描 {label} ...")
+        hits[label] = _probe(channel, probe_ids, timeout, driver)
+        drivers[label] = driver
+        if hits[label]:
+            say(f"  {label} 上发现 {len(hits[label])} 个电机：{sorted(hits[label])}")
 
     if not forced:
-        # 每条臂各挑命中最多的那个口；两条臂可能落在同一个口上
+        # 每条臂各挑命中最多的那条总线；两条臂可能落在同一条上
         for side in config.SIDES:
-            best_channel, best_hits = None, -1
-            for channel in channels:
-                count = len(hits[channel] & set(id_of_side[side]))
+            best_label, best_hits = None, -1
+            for label in hits:
+                count = len(hits[label] & set(id_of_side[side]))
                 if count > best_hits:
-                    best_channel, best_hits = channel, count
-            if best_channel is not None and best_hits > 0:
-                mapping[side] = best_channel
+                    best_label, best_hits = label, count
+            if best_label is not None and best_hits > 0:
+                mapping[side] = best_label
 
     if not mapping:
         raise DetectError(
             "没有扫到任何电机。请检查：CAN 线是否插好、机器人是否上电、"
-            "是否已执行 sudo bash canup.sh。"
+            "是否已执行 bash app/canup.sh（Linux）或装好适配器驱动（Windows）。"
         )
 
     expected = config.names_for(expect)
@@ -289,17 +372,23 @@ def scan(
     online: dict[str, set[int]] = {}
     groups: dict[str, list[str]] = {}
     for side in config.SIDES:
-        channel = mapping.get(side)
-        if channel is None:
+        label = mapping.get(side)
+        if label is None:
             continue
-        found = hits.get(channel, set()) & set(id_of_side[side])
+        found = hits.get(label, set()) & set(id_of_side[side])
         online[side] = found
         for spec in config.MOTORS:
             if spec.side == side and spec.can_id in found and spec.name in wanted:
-                groups.setdefault(channel, []).append(spec.name)
+                groups.setdefault(label, []).append(spec.name)
 
     if not groups:
-        raise DetectError("找到了 CAN 口，但没有任何电机响应。请确认机器人已上电。")
+        raise DetectError("找到了总线，但没有任何电机响应。请确认机器人已上电。")
 
-    channels_clean = {channel: config.sort_names(names) for channel, names in groups.items()}
-    return Setup(channels=channels_clean, mapping=mapping, online=online, expected=expected)
+    channels_clean = {label: config.sort_names(names) for label, names in groups.items()}
+    return Setup(
+        channels=channels_clean,
+        mapping=mapping,
+        online=online,
+        expected=expected,
+        interface={label: drivers.get(label, config.default_can_interface()) for label in channels_clean},
+    )

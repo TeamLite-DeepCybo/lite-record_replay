@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import queue
 import subprocess
 import sys
@@ -29,7 +30,7 @@ from datetime import datetime
 from pathlib import Path
 from tkinter import messagebox, ttk
 
-from bhl import config, detect, motion as motion_mod, storage
+from bhl import config, detect, paths, motion as motion_mod, storage
 from bhl.arm import Arm
 
 # ======================================================================
@@ -59,19 +60,33 @@ C = {
 }
 
 UI_FAMILIES = (
-    "Noto Sans CJK SC",
+    "Noto Sans CJK SC",      # Linux（本机）
     "Source Han Sans SC",
     "WenQuanYi Micro Hei",
+    "Microsoft YaHei UI",    # Windows
     "Microsoft YaHei",
-    "PingFang SC",
+    "PingFang SC",           # macOS
     "Noto Sans",
     "DejaVu Sans",
 )
-MONO_FAMILIES = ("Noto Sans Mono CJK SC", "DejaVu Sans Mono", "Noto Sans CJK SC")
+MONO_FAMILIES = (
+    "Noto Sans Mono CJK SC",
+    "DejaVu Sans Mono",
+    "Cascadia Mono",         # Windows
+    "Consolas",
+    "Noto Sans CJK SC",
+)
 
 VERSION = "2.0.5"
-ROOT_DIR = Path(__file__).resolve().parent
-ASSETS = ROOT_DIR / "assets"
+
+
+def display_version() -> str:
+    """Windows 版在版本号后面加 -win（同一个代码库，两个平台的发布号）。"""
+    return f"{VERSION}-win" if sys.platform.startswith("win") else VERSION
+
+
+ROOT_DIR = paths.app_root()          # 可写目录（数据、标定）
+ASSETS = paths.resource_dir() / "assets"   # 只读资源（打包后在解包目录）
 
 # 窗口：默认大小（实测用着舒服的尺寸）与内边距
 WINDOW_SIZE = (1540, 990)
@@ -297,9 +312,11 @@ class App:
         root: tk.Tk,
         forced_channels: dict[str, str] | None = None,
         robot_type: str = "auto",
+        interface: str = "auto",
     ) -> None:
         self.root = root
         self.forced_channels = forced_channels
+        self.interface = interface
         self.robot_type = tk.StringVar(value=robot_type)
         self.last_setup = None
 
@@ -331,7 +348,7 @@ class App:
     # 界面
     # ==================================================================
     def _build(self) -> None:
-        self.root.title(f"Prime Lite · 动作录制 / 回放　v{VERSION}")
+        self.root.title(f"Prime Lite · 动作录制 / 回放　v{display_version()}")
         self.fonts = _setup_theme(self.root)
 
         screen_width = self.root.winfo_screenwidth()
@@ -378,7 +395,7 @@ class App:
             ttk.Label(header, image=self._logo_image).grid(row=0, column=2, sticky="e")
 
         # 版本号紧跟 logo 右边
-        ttk.Label(header, text=f"v{VERSION}", style="Muted.TLabel").grid(
+        ttk.Label(header, text=f"v{display_version()}", style="Muted.TLabel").grid(
             row=0, column=3, sticky="e", padx=(10, 0)
         )
 
@@ -717,7 +734,9 @@ class App:
         label = config.ROBOT_TYPE_LABELS.get(robot_type, robot_type)
         try:
             self._log_safe(f"扫描电机（机型：{label}）…")
-            setup = detect.scan(forced=forced, expect=robot_type, on_progress=self._log_safe)
+            setup = detect.scan(
+                forced=forced, expect=robot_type, interface=self.interface, on_progress=self._log_safe
+            )
             self._log_safe(setup.describe(), "warn" if setup.missing else "ok")
             self._post(("scan", (setup, robot_type)))
         except Exception as exc:
@@ -772,9 +791,11 @@ class App:
         text.tag_configure("dim", foreground=C["muted"])
 
         for side, side_label in (("left", "左臂"), ("right", "右臂")):
-            channel = setup.mapping.get(side)
-            if channel:
-                text.insert("end", f"{side_label} → {channel}\n", ("dim",))
+            label = setup.mapping.get(side)
+            if label:
+                driver = (setup.interface or {}).get(label, "")
+                suffix = f"  [{driver}]" if driver and driver != "socketcan" else ""
+                text.insert("end", f"{side_label} → {label}{suffix}\n", ("dim",))
         text.insert("end", "\n")
 
         for spec in config.MOTORS:
@@ -813,7 +834,7 @@ class App:
             channels = list(dict.fromkeys(forced_channels.values())) if forced_channels else None
 
             # 没配置好就自动跑一次 canup.sh（和老程序启动时的行为一致）
-            ready, messages = detect.ensure_can(channels, on_progress=self._log_safe)
+            ready, messages = detect.ensure_can(channels, on_progress=self._log_safe, interface=self.interface)
             for message in messages:
                 self._log_safe(f"  · {message}", "warn")
             if not ready:
@@ -827,7 +848,10 @@ class App:
             self._log_safe(f"扫描电机（机型：{config.ROBOT_TYPE_LABELS.get(robot_type, robot_type)}）…")
             try:
                 setup = detect.scan(
-                    forced=forced_channels, expect=robot_type, on_progress=self._log_safe
+                    forced=forced_channels,
+                    expect=robot_type,
+                    interface=self.interface,
+                    on_progress=self._log_safe,
                 )
             except detect.DetectError:
                 # 一个电机都没扫到：USB-CAN 常常要在适配器重新上电后重新配置一次
@@ -837,7 +861,10 @@ class App:
                     if line.strip():
                         self._log_safe("  " + line.strip(), "dim")
                 setup = detect.scan(
-                    forced=forced_channels, expect=robot_type, on_progress=self._log_safe
+                    forced=forced_channels,
+                    expect=robot_type,
+                    interface=self.interface,
+                    on_progress=self._log_safe,
                 )
 
             self._log_safe(setup.describe(), "warn" if setup.missing else "info")
@@ -855,7 +882,7 @@ class App:
                     f"这些关节没有标定偏移，按 0 处理：{', '.join(missing)}", "warn"
                 )
 
-            arm = Arm(setup.channels, calibration)
+            arm = Arm(setup.channels, calibration, interface=setup.interface)
             self.arm = arm
             self.last_setup = setup
             self._log_safe("已连接 · " + arm.summary(), "ok")
@@ -1068,8 +1095,12 @@ class App:
         folder = storage.MOTIONS_DIR
         try:
             folder.mkdir(parents=True, exist_ok=True)
-            command = ["open", str(folder)] if sys.platform == "darwin" else ["xdg-open", str(folder)]
-            subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            if sys.platform.startswith("win"):
+                os.startfile(str(folder))          # noqa: S606  资源管理器打开
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", str(folder)])
+            else:
+                subprocess.Popen(["xdg-open", str(folder)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             self._log_text(f"录制目录：{folder}")
         except Exception as exc:
             self._log_text(f"打不开文件管理器（{exc}），路径：{folder}", "warn")
@@ -1115,7 +1146,12 @@ def main() -> int:
     parser.add_argument("--channels", "-c", default="", help="手动指定左右臂 CAN 口，例如 can2,can1（默认自动识别）")
     parser.add_argument("--import-legacy", default="", metavar="DIR", help="把旧版 .npy 录制批量导入后退出")
     parser.add_argument("--list", action="store_true", help="列出现有录制后退出")
-    parser.add_argument("--version", action="version", version=f"Prime Lite 动作录制/回放 v{VERSION}")
+    parser.add_argument("--version", action="version", version=f"Prime Lite 动作录制/回放 v{display_version()}")
+    parser.add_argument(
+        "--interface",
+        default="auto",
+        help="CAN 驱动：Linux 默认 socketcan；Windows 可填 pcan / canalystii / slcan / gs_usb 等（默认自动探测）",
+    )
     parser.add_argument(
         "--robot",
         "-r",
@@ -1148,7 +1184,7 @@ def main() -> int:
         print(f"无法打开窗口（{exc}）。请在有图形界面的终端里运行。", file=sys.stderr)
         return 1
 
-    App(root, forced, args.robot)
+    App(root, forced, args.robot, args.interface)
     root.mainloop()
     return 0
 

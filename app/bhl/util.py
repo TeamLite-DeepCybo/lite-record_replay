@@ -43,7 +43,7 @@ def quiet():
     """
 
     buffer = io.StringIO()
-    with contextlib.redirect_stdout(buffer):
+    with contextlib.redirect_stdout(buffer), contextlib.redirect_stderr(buffer):
         yield buffer
 
 

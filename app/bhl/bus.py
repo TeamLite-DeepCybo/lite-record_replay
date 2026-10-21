@@ -18,6 +18,7 @@ import contextlib
 import struct
 import time
 
+import can
 from robstride_dynamics import ParameterType, RobstrideBus
 from robstride_dynamics.protocol import CommunicationType
 from robstride_dynamics.table import (
@@ -76,12 +77,35 @@ def _decode(model: str, data: bytes, calibration: dict | None, name: str) -> Sta
 class ArmBus(RobstrideBus):
     """一条 CAN 总线（一条臂，或两条臂共用一条）。"""
 
-    def __init__(self, channel: str, motors: dict, calibration: dict | None = None, bitrate: int = 1_000_000):
+    def __init__(
+        self,
+        channel: str,
+        motors: dict,
+        calibration: dict | None = None,
+        bitrate: int = 1_000_000,
+        interface: str = "socketcan",
+    ):
         super().__init__(channel=channel, motors=motors, calibration=calibration, bitrate=bitrate)
+        # 库把 interface 写死成 socketcan（Linux），Windows/macOS 必须换驱动
+        self.interface = interface
         self._expect_id: int | None = None
         self.skipped = 0  # 丢掉的陈旧帧 / 串扰帧
         self.dropped = 0  # 没有按时回帧的次数
         self.max_round_trip = 0.0
+
+    def connect(self, handshake: bool = True) -> None:
+        """覆盖库的实现：用可配置的 CAN 接口打开总线。
+
+        robstride_dynamics 里写死了 interface="socketcan"，
+        在 Windows 上要换成 pcan / canalystii / slcan / gs_usb 之类。
+        """
+        if self.is_connected:
+            raise RuntimeError(f"{self.channel} 已经打开了，不要重复 connect()")
+        self.channel_handler = can.interface.Bus(
+            interface=self.interface,
+            channel=self.channel,
+            bitrate=self.bitrate,
+        )
 
     # ------------------------------------------------------------------
     # 底层收发

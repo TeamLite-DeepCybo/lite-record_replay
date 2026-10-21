@@ -1,0 +1,7 @@
+# Windows 运行时依赖（与 app/requirements.txt 保持一致）
+# 安装入口 : windows\1-安装.bat
+# Python   : 3.10+ 64 位（x64 / arm64）
+numpy>=1.24
+robstride-dynamics>=0.0.1
+# python-can 由 robstride-dynamics 带入（LGPL-3.0，仅作为依赖，不随本仓库分发）
+# Windows 下用它的厂商驱动：pcan / canalystii / slcan / gs_usb / kvaser / vector ...

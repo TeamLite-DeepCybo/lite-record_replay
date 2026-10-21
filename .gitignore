@@ -4,6 +4,8 @@ app/data/motions/*.npz
 __pycache__/
 *.pyc
 .venv/
+dist/
+build/
 # 系统/编辑器
 .DS_Store
 *.swp

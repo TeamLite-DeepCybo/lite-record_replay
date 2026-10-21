@@ -33,6 +33,11 @@ COVERAGE = 0.8  # 行程至少要走到理论行程的 80% 才算"推到位了"
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Prime Lite 双臂标定")
+    parser.add_argument(
+        "--interface",
+        default="auto",
+        help="CAN 驱动：Linux 默认 socketcan；Windows 可填 pcan / canalystii / slcan / gs_usb 等",
+    )
     parser.add_argument("--channels", "-c", default="", help="手动指定左右臂 CAN 口，例如 can2,can1")
     parser.add_argument("--yes", "-y", action="store_true", help="不询问，直接写入")
     args = parser.parse_args()
@@ -40,14 +45,14 @@ def main() -> int:
     forced = detect.parse_channels(args.channels) if args.channels else None
     channels = list(dict.fromkeys(forced.values())) if forced else None
 
-    ready, messages = detect.ensure_can(channels, on_progress=print)
+    ready, messages = detect.ensure_can(channels, on_progress=print, interface=args.interface)
     for message in messages:
         print(f"  · {message}")
     if not ready:
         return 1
 
     print("扫描电机 …")
-    setup = detect.scan(forced=forced, on_progress=print)
+    setup = detect.scan(forced=forced, interface=args.interface, on_progress=print)
     print(setup.describe())
 
     arm = Arm(setup.channels, None)  # 标定时不能用旧标定

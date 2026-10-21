@@ -30,6 +30,7 @@ class Arm:
         setup: dict[str, list[str]],
         calibration: dict | None = None,
         *,
+        interface: dict[str, str] | None = None,
         timeout: float = 0.1,
     ) -> None:
         """setup 形如 {"can0": ["left_shoulder_pitch", ...], "can1": [...]}，
@@ -37,6 +38,8 @@ class Arm:
         """
         self.calibration = calibration
         self.timeout = timeout
+        # 每个总线用哪个 CAN 驱动：Linux 是 socketcan，Windows 看适配器
+        self._interface = dict(interface or {})
 
         # 按电机表顺序排列，保证录制/回放每一列的含义固定
         self._names = config.sort_names([name for names in setup.values() for name in names])
@@ -82,6 +85,10 @@ class Arm:
     def channel_of(self, name: str) -> str:
         return self._bus_of[name].channel
 
+    @property
+    def interfaces(self) -> dict[str, str]:
+        return {channel: bus.interface for channel, bus in self._buses.items()}
+
     # ------------------------------------------------------------------
     # 连接 / 断开
     # ------------------------------------------------------------------
@@ -95,8 +102,9 @@ class Arm:
                     for name in names
                 }
                 # 库的构造和 connect() 会往 stdout 打大段标定字典，这里统一静音
+                driver = self._interface.get(channel) or config.default_can_interface()
                 with quiet():
-                    bus = ArmBus(channel, motors, self.calibration)
+                    bus = ArmBus(channel, motors, self.calibration, interface=driver)
                     bus.connect()
                 self._buses[channel] = bus
                 self._names_on[channel] = list(names)

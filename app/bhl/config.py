@@ -8,6 +8,7 @@ CAN 通道**不用**在这里改：程序启动时会自动识别每条臂接在
 from __future__ import annotations
 
 import math
+import sys
 from dataclasses import dataclass
 
 
@@ -73,8 +74,15 @@ def sort_names(names) -> list[str]:
 # ==========================================================================
 SIDES = ("left", "right")
 
-# 自动识别时扫描哪些 CAN 口（和 canup.sh 里启用的保持一致）
+# 自动识别时扫描哪些 CAN 口（仅 Linux/socketcan 用；和 canup.sh 里启用的保持一致）
 CANDIDATE_CHANNELS = ("can0", "can1", "can2", "can3", "can4")
+
+# Windows/macOS 用 python-can 的硬件驱动，按需枚举（见 bhl/detect.py）
+# 这些驱动只是"虚拟/网络"通道，不是真实 CAN 适配器，自动识别时跳过
+VIRTUAL_CAN_DRIVERS = {
+    "virtual", "udp_multicast", "socketcand", "remote",
+    "serial",   # python-can 的通用串口通道，不是 CAN 适配器（会列出几十个 COM 口）
+}
 
 # 自动识别失败 / 手动模式下的兜底映射
 DEFAULT_CHANNELS = {"left": "can0", "right": "can1"}
@@ -117,6 +125,15 @@ ROBOT_TYPE_LABELS = {
     "gripper": "有夹爪",
     "no_gripper": "无夹爪",
 }
+
+
+def is_windows() -> bool:
+    return sys.platform.startswith("win")
+
+
+def default_can_interface() -> str:
+    """没有显式指定驱动时的默认值。"""
+    return "socketcan" if not is_windows() else "pcan"
 
 
 def specs(names) -> list[MotorSpec]:

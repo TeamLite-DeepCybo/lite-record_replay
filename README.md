@@ -2,6 +2,8 @@
 
 Prime Lite 半身双臂机器人的**拖动示教录制 / 动作回放**工具：一个窗口、两个脚本就能用。
 
+支持 **Linux**（`v2.0.5`）与 **Windows**（`v2.0.5-win`，x64 / arm64），同一套代码、同一个界面。
+
 ![界面预览](app/docs/ui-preview.png)
 
 - **零配置**：启动时自动配置 CAN 口、自动识别左右臂在哪条总线、有没有夹爪、哪些电机在线
@@ -15,10 +17,25 @@ Prime Lite 半身双臂机器人的**拖动示教录制 / 动作回放**工具�
 
 ## 快速开始
 
+**Linux**
+
 ```bash
 ./install.sh    # 一键安装（新机器跑一次，装 python3-tk / numpy / robstride-dynamics）
 ./start.sh      # 一键启动
 ```
+
+**Windows —— 两种方式，任选一种**
+
+方式 A（推荐，免安装 Python）：到 [Releases](https://github.com/TeamLite-DeepCybo/lite-record_replay/releases)
+下载 `LiteRecordReplay-*-x64.zip`（arm64 机器下 `-arm64`），解压后**直接双击 `LiteRecordReplay.exe`**。
+单文件、带图标、无黑框，机器上不需要装 Python。
+
+方式 B（从源码跑，便于改代码）：双击 `windows\1-安装.bat` 装好环境（会顺带创建桌面快捷方式），
+再双击 `windows\2-启动.bat`；没装过环境时 `2-启动.bat` 会自动先装。
+
+> 两种方式的界面、功能、CAN 驱动完全一样；方式 A 的 exe 由
+> [GitHub Actions](.github/workflows/build-exe.yml) 在 Windows runner 上自动构建（x64 + arm64），
+> 每次打 tag 都会重新生成并挂到 Release。
 
 启动后等它扫完电机，直接点「开始录制」即可，**不需要改任何代码**。
 
@@ -71,6 +88,73 @@ Prime Lite 半身双臂机器人的**拖动示教录制 / 动作回放**工具�
 
 **出发前靠近**：默认 0.5 秒、最小 0.5 秒。回放前用这段时间从当前姿态平缓走到动作第一帧；
 姿态差得多时会自动按 0.4 rad/s 以内的安全速度延长。
+
+---
+
+## Windows 版（v2.0.5-win）
+
+界面、功能、快捷键与 Linux 版**完全一致**，差异只在 CAN 驱动层。
+
+| 项目 | 说明 |
+|---|---|
+| 系统 | Windows 10 / 11，**64 位**（x64 或 arm64） |
+| Python | 3.9+，安装时勾选 **Add Python to PATH**（没装的话安装脚本会自动打开下载页） |
+| 运行环境 | 装在仓库根的 `.venv\`（独立虚拟环境，不污染系统 Python，卸载=删文件夹） |
+| 安装 | `windows\1-安装.bat`（`bin\find_python.ps1` 找 3.10+，缺失可 `winget` 自动装） |
+| 启动 | `windows\2-启动.bat` / 桌面快捷方式；排查用 `windows\bin\run.bat`（带控制台） |
+
+### CAN 适配器
+
+Windows 没有 socketcan，改用 python-can 的厂商驱动。程序启动时会自动枚举已插好的适配器，
+自动认出哪条是左臂、哪条是右臂（和 Linux 一样的逻辑：ping 电机 ID 看谁响应）。
+
+已内置支持（装好厂商驱动即可）：
+
+| 适配器 | 驱动名 | 备注 |
+|---|---|---|
+| PEAK PCAN-USB | `pcan` | 装 PCAN-Basic |
+| 周立功 CANalyst-II | `canalystii` | 装厂家驱动 |
+| CANable / slcan 串口 | `slcan` | 需要指定 COM 口 |
+| gs_usb / candlelight | `gs_usb` | 免驱（WinUSB） |
+| Kvaser / Vector / SYSTEC / IXXAT | 同名 | 装厂家驱动 |
+
+如果自动识别不理想，手动指定：
+
+```bat
+windows\2-启动.bat --interface pcan
+windows\2-启动.bat --interface slcan --channels COM3,COM4
+```
+
+或者用命令行看一眼当前能认出什么：
+
+```bat
+.venv\Scripts\python.exe app\discover.py --interface pcan
+```
+
+### 常见问题（Windows）
+
+**双击没反应 / 闪一下就没了**
+
+改用 `windows\bin\run.bat`（带控制台），它会保留窗口并显示完整报错。
+
+**提示 32 位 Python**
+
+新版 numpy 不再提供 32 位（x86）安装包。请改装 64 位 Python（x64 或 arm64 均可），
+`windows\1-安装.bat` 检测到 32 位会直接提示并退出。
+
+**杀毒软件拦截**
+
+`.venv\` 里的 python 是标准 Python 虚拟环境，部分杀软会对新生成的 exe 报警，
+加白名单即可。
+
+**想要一个真正的 .exe（单文件，双击即用）**
+
+在 Windows 上运行 `windows\bin\build_exe.bat`，会用 PyInstaller 打出
+`dist\LiteRecordReplay.exe`。注意 exe 与架构相关，要给 x64 / arm64 各打一次。
+
+**卸载**
+
+删掉整个文件夹即可（运行环境都在 `.venv\` 里，注册表无残留）。
 
 ---
 
@@ -151,8 +235,9 @@ python3 app/main.py --list
 .
 ├── README.md              本文件
 ├── LICENSE                Apache-2.0
-├── install.sh             一键安装
-├── start.sh               一键启动
+├── install.sh             一键安装（Linux）
+├── start.sh               一键启动（Linux）
+├── windows/               Windows 编号入口（1-安装 / 2-启动）+ bin/ 实现 + README/RELEASE
 └── app/                   程序本体
     ├── main.py            界面入口
     ├── calibrate.py       标定
@@ -182,6 +267,7 @@ python3 app/main.py --list
 
 | 版本 | 内容 |
 |---|---|
+| **v2.0.5-win** | Windows 版：CAN 驱动层抽象（pcan / canalystii / slcan / gs_usb … 自动枚举）、一键安装与一键启动脚本、桌面快捷方式、单文件 exe 打包脚本 |
 | **v2.0.5** | 界面细化（五种按钮配色、公司 logo、版本号、布局对齐）；新增机型选择与电机扫描；修复重上电后首次回放突然大动、速度前馈抖动；整理目录、补 LICENSE |
 | **v2.0.0** | 重构：4 份重复代码合成一份 + `app/bhl` 模块化；录制带时间戳、关节按名字对齐、自描述录制文件、命令行参数化 |
 | **v1.2.0** | 无夹爪版本支持重复回放（`no_gripper_repeat`） |

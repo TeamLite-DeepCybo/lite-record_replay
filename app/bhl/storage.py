@@ -12,16 +12,17 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 from datetime import datetime
 from pathlib import Path
 
 import numpy as np
 
-from . import config
+from . import config, paths
 from .motion import Motion
 from .util import pretty, stamp
 
-ROOT = Path(__file__).resolve().parent.parent
+ROOT = paths.app_root()   # 打包成 exe 后是 exe 所在目录
 MOTIONS_DIR = ROOT / "data" / "motions"
 
 FORMAT = "bhl-motion-1"
@@ -228,12 +229,32 @@ def default_legacy_dirs() -> list[Path]:
 # ======================================================================
 # 标定
 # ======================================================================
+def release_bundled_calibration() -> bool:
+    """打包成 exe 后第一次运行：把内置的标定文件放到 exe 旁边。
+
+    否则 exe 单文件拷到别处就没有标定，关节读数是错的（offset 全 0）。
+    """
+    target = ROOT / config.CALIBRATION_FILE
+    if target.exists():
+        return False
+    bundled = paths.resource_dir() / config.CALIBRATION_FILE
+    try:
+        if not bundled.exists() or bundled.resolve() == target.resolve():
+            return False
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(bundled, target)
+        return True
+    except OSError:
+        return False
+
+
 def load_calibration(online_names=None):
     """读标定文件，返回 (给 RobstrideBus 用的标定字典, 文件名, 缺 offset 的关节)。
 
     关节方向以 config.py 为准，这里只取 home 偏移量，
     避免"方向在三个地方各写一遍"的老问题。
     """
+    release_bundled_calibration()
     path = ROOT / config.CALIBRATION_FILE
     if not path.exists():
         for fallback in config.CALIBRATION_FALLBACKS:
