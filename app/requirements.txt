@@ -1,0 +1,4 @@
+# 运行时依赖（一键安装脚本会自动装好）
+numpy>=1.24
+robstride-dynamics>=0.0.1
+# python-can 由 robstride-dynamics 自动带入（LGPL-3.0，仅作为依赖，不随本仓库分发）
