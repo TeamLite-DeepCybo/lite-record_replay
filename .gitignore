@@ -1,0 +1,9 @@
+# 录制的动作数据（属于使用者自己的数据，不入库）
+*.npy
+app/data/motions/*.npz
+__pycache__/
+*.pyc
+.venv/
+# 系统/编辑器
+.DS_Store
+*.swp
