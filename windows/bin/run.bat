@@ -9,7 +9,10 @@ cd /d "%~dp0..\.."
 if not exist ".venv\Scripts\python.exe" (
   echo 运行环境不存在，正在自动安装 ...
   call "windows\bin\install.bat" --no-pause
-  if errorlevel 1 pause & exit /b 1
+  if errorlevel 1 (
+    pause
+    exit /b 1
+  )
 )
 
 ".venv\Scripts\python.exe" "app\main.py" %*

@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import contextlib
 import struct
+import threading
 import time
 
 import can
@@ -28,6 +29,31 @@ from robstride_dynamics.table import (
 )
 
 Status = tuple[float, float, float, float]  # (位置 rad, 速度 rad/s, 力矩 Nm, 温度 ℃)
+
+
+def _bounded(func, timeout: float = 6.0, what: str = "CAN 调用"):
+    """给底层打开/关闭套一个"软"超时，防止界面被永远卡住。
+
+    注：超时后调用线程还挂在原生库里 —— 所以扫描/监听这种高危操作都走子进程
+    （detect.run_worker），这里只兜正式连接/断开这些硬件健康时的路径。
+    """
+    box: dict = {}
+
+    def runner() -> None:
+        try:
+            box["value"] = func()
+        except BaseException as exc:  # noqa: BLE001
+            box["error"] = exc
+
+    thread = threading.Thread(target=runner, daemon=True, name="can-bus-call")
+    thread.start()
+    thread.join(timeout)
+    if thread.is_alive():
+        raise RuntimeError(f"{what}超过 {timeout:.0f} 秒没有返回（设备可能被别的程序占用）")
+    error = box.get("error")
+    if error is not None:
+        raise error
+    return box.get("value")
 
 
 class MotorTimeout(RuntimeError):
@@ -74,6 +100,65 @@ def _decode(model: str, data: bytes, calibration: dict | None, name: str) -> Sta
     return position, velocity, torque, temperature
 
 
+# gs_usb 预热用的仲裁号：扩展帧里通信类型 31 在 Robstride 协议里不存在，
+# 电机不会响应，总线上其它节点也只会忽略 —— 只为把 USB 端点"点着"。
+_GS_USB_WARMUP_ID = 0x1FFF_FFFF
+
+
+def _prime_gs_usb(handler) -> None:
+    """把 gs_usb 的发送端点"点着"。
+
+    实测（candleLight_fw + WinUSB）：刚 start() 完的第一帧 bulk OUT 会被固件丢掉，
+    表现为 1 秒的 USB 超时（`CanOperationError: The message could not be sent`），
+    从第二帧起才正常。不预热的话，扫描电机时的**第一个 ping 必定超时**，
+    于是这条总线被判定成"没有电机"，看起来就像"CAN 用不了"。
+
+    这里先发一帧没人会理的扩展帧把这一次超时吃掉；失败也无所谓，目的已经达到。
+    """
+    try:
+        handler.send(can.Message(arbitration_id=_GS_USB_WARMUP_ID, is_extended_id=True, data=[]))
+    except Exception:
+        pass
+
+
+def release_usb(handler) -> None:
+    """把适配器的底层句柄还给系统。
+
+    Windows 上这些是**独占句柄**：不主动释放，同一个适配器第二次打开就会失败 ——
+    而"扫描电机"和"正式连接"正好各要开一次。
+
+    覆盖两种后端：
+      - `gs_usb`（python-can 自带）：GsUsbBus.shutdown() 只发"停止"命令，
+        libusb 句柄要靠 `usb.util.dispose_resources` 收；
+      - `candle`（python-can-candle 插件）：CandleBus.shutdown() 只 reset 通道，
+        没调 `CandleDevice.close()`，句柄要等 GC —— 实测开 8~10 次之后就开始
+        `Cannot open device`，所以这里显式关掉。
+    """
+    # 1) gs_usb：python-can 的 GsUsbBus → gs_usb 包 → usb.core.Device
+    gs_usb = getattr(handler, "gs_usb", None)
+    if gs_usb is not None:
+        inner = getattr(gs_usb, "gs_usb", gs_usb)
+        try:
+            import usb.util
+
+            usb.util.dispose_resources(inner)
+        except Exception:
+            pass
+        return
+
+    # 2) candle：CandleBus 内部持有 CandleDevice
+    device = getattr(handler, "_device", None)
+    close = getattr(device, "close", None)
+    if callable(close):
+        # shutdown() 里的 ch.reset() 是异步的：紧接着 close 可能在固件还没
+        # 消化 reset 时就把设备掐了，偶尔会把设备从 USB 上打掉。等一小下再关。
+        time.sleep(0.25)
+        try:
+            close()
+        except Exception:
+            pass
+
+
 class ArmBus(RobstrideBus):
     """一条 CAN 总线（一条臂，或两条臂共用一条）。"""
 
@@ -84,14 +169,24 @@ class ArmBus(RobstrideBus):
         calibration: dict | None = None,
         bitrate: int = 1_000_000,
         interface: str = "socketcan",
+        open_kwargs: dict | None = None,
     ):
         super().__init__(channel=channel, motors=motors, calibration=calibration, bitrate=bitrate)
         # 库把 interface 写死成 socketcan（Linux），Windows/macOS 必须换驱动
         self.interface = interface
+        # 打开总线时要用的**真正通道值**和额外参数。
+        # Windows 的适配器标签（"candleLight#0"）和 python-can 要的 channel（整数下标）
+        # 不是一回事，所以由 detect.py 提前算好放在这里。
+        self.open_kwargs = dict(open_kwargs or {})
         self._expect_id: int | None = None
         self.skipped = 0  # 丢掉的陈旧帧 / 串扰帧
         self.dropped = 0  # 没有按时回帧的次数
         self.max_round_trip = 0.0
+
+    @property
+    def open_channel(self):
+        """交给 python-can 的通道值；没显式给就是标签本身（Linux 的 can0/can1）。"""
+        return self.open_kwargs.get("channel", self.channel)
 
     def connect(self, handshake: bool = True) -> None:
         """覆盖库的实现：用可配置的 CAN 接口打开总线。
@@ -101,11 +196,38 @@ class ArmBus(RobstrideBus):
         """
         if self.is_connected:
             raise RuntimeError(f"{self.channel} 已经打开了，不要重复 connect()")
-        self.channel_handler = can.interface.Bus(
-            interface=self.interface,
-            channel=self.channel,
-            bitrate=self.bitrate,
+        kwargs = dict(self.open_kwargs)
+        kwargs.setdefault("channel", self.channel)
+        kwargs.setdefault("bitrate", self.bitrate)
+        handler = _bounded(
+            lambda: can.interface.Bus(interface=self.interface, **kwargs),
+            what=f"打开 {self.channel}",
         )
+        if str(self.interface).lower() == "gs_usb":
+            _prime_gs_usb(handler)
+        self.channel_handler = handler
+
+    def disconnect(self, disable_torque: bool = True) -> None:
+        """关总线。
+
+        除了库原本的 shutdown()，gs_usb（candleLight / CANable）还要把
+        **libusb 的设备句柄还回去** —— Python 的垃圾回收不管这个，Windows 上
+        句柄不放掉，同一个适配器第二次打开就会报 `Access denied`；
+        而"扫描电机"和"正式连接"正好会各开一次。
+        """
+        handler = self.channel_handler
+        try:
+            super().disconnect(disable_torque=disable_torque)
+        finally:
+            if handler is not None:
+                try:
+                    _bounded(handler.shutdown, what=f"关闭 {self.channel}")   # 幂等
+                except Exception:
+                    pass
+                try:
+                    _bounded(lambda: release_usb(handler), what="释放 USB 句柄")
+                except Exception:
+                    pass
 
     # ------------------------------------------------------------------
     # 底层收发
@@ -139,6 +261,9 @@ class ArmBus(RobstrideBus):
             frame = self.channel_handler.recv(timeout=remain)
             if frame is None:
                 return None
+            if not getattr(frame, "is_rx", True):
+                self.skipped += 1  # 自己刚发出去的帧被适配器回显了，不能当应答
+                continue
             if not frame.is_extended_id:
                 self.skipped += 1  # 电机掉线重连时会出现这种帧
                 continue
@@ -170,6 +295,9 @@ class ArmBus(RobstrideBus):
             frame = self.channel_handler.recv(timeout=remain)
             if frame is None:
                 break
+            if not getattr(frame, "is_rx", True):
+                self.skipped += 1  # 自己刚发出去的帧被适配器回显了
+                continue
             if not frame.is_extended_id:
                 self.skipped += 1
                 continue

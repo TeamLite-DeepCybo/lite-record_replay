@@ -19,4 +19,20 @@ if not exist ".venv\Scripts\pythonw.exe" (
 )
 
 start "Lite 动作录制/回放" ".venv\Scripts\pythonw.exe" "app\main.py" %*
+
+rem pythonw 出错时不会留下任何窗口，看起来就是"闪一下就没了"。
+rem 这里等几秒确认进程还在；不在了就把话说清楚，并指出能看报错的那个入口。
+timeout /t 4 /nobreak >nul
+tasklist /fi "imagename eq pythonw.exe" 2>nul | find /i "pythonw.exe" >nul
+if errorlevel 1 (
+  echo.
+  echo [启动失败] 界面没能起来，通常是依赖没装好或图形环境有问题。
+  echo 用这个命令启动可以看到完整报错：
+  echo     windows\bin\run.bat
+  echo.
+  echo 也可以先跑一次自检：
+  echo     .venv\Scripts\python.exe windows\bin\selfcheck.py
+  pause
+  exit /b 1
+)
 exit /b 0

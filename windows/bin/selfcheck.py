@@ -55,6 +55,20 @@ def main() -> int:
         except Exception as exc:                       # noqa: BLE001
             bad(f"{label} 导入失败：{exc}")
 
+    # USB-CAN（candleLight / CANable）链路上的三件套，缺任何一个都会"看不到适配器"
+    for module, label, needed in (
+        ("usb", "pyusb", True),
+        ("gs_usb", "gs_usb", True),
+        ("libusb_package", "libusb-package", True),
+    ):
+        try:
+            imported = __import__(module)
+            version = getattr(imported, "__version__", "")
+            ok(f"{label} {version}".strip())
+        except Exception as exc:                       # noqa: BLE001
+            if needed:
+                bad(f"{label} 导入失败（USB-CAN 需要它）：{exc}")
+
     print("== Tk 界面 ==")
     try:
         import tkinter as tk
@@ -72,33 +86,20 @@ def main() -> int:
         from bhl import config, detect  # noqa: PLC0415
 
         ok(f"bhl 模块可用，电机表 {len(config.MOTORS)} 个")
-        drivers = [
-            ("pcan", "PEAK PCAN-USB"),
-            ("canalystii", "周立功 CANalyst-II"),
-            ("slcan", "CANable / slcan 串口"),
-            ("gs_usb", "gs_usb / candlelight"),
-        ]
-        available = []
-        if not sys.platform.startswith("win"):
+
+        # 和 GUI 走同一条枚举路径：Linux 是 can0~can4，Windows 是厂商驱动 + gs_usb
+        try:
             targets = detect.list_targets()
-            if targets:
-                ok("检测到 CAN 总线：" + "，".join(label for label, _, _ in targets[:6]))
-                return _finish()
-
-        for driver, label in drivers:
-            try:
-                import can
-
-                found = can.detect_available_configs(interfaces=[driver])
-            except Exception:                          # noqa: BLE001
-                found = []
-            if found:
-                available.append(f"{label}（{driver}）")
-        if available:
-            ok("检测到 CAN 适配器：" + "，".join(available))
+        except Exception as exc:                       # noqa: BLE001
+            targets = []
+            info(f"枚举适配器失败：{exc}")
+        if targets:
+            ok("检测到 CAN 适配器：" + "，".join(target.label for target in targets[:6]))
         else:
-            info("暂未检测到 CAN 适配器 —— 装好 USB-CAN 驱动后插上即可；")
-            info("  python app\\discover.py --interface pcan 可查看具体驱动")
+            info("暂未检测到 CAN 适配器 —— 装好 USB-CAN 驱动、插上适配器即可；")
+            for item in detect.missing_components():
+                info(f"  - {item}")
+            info("  也可以手动看：python app\\discover.py --interface gs_usb")
     except Exception as exc:                           # noqa: BLE001
         bad(f"bhl 导入失败：{exc}")
 

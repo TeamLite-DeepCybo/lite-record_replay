@@ -31,15 +31,20 @@ class Arm:
         calibration: dict | None = None,
         *,
         interface: dict[str, str] | None = None,
+        options: dict[str, dict] | None = None,
         timeout: float = 0.1,
     ) -> None:
         """setup 形如 {"can0": ["left_shoulder_pitch", ...], "can1": [...]}，
         通常直接来自 `detect.scan()`。
+
+        interface 是每条总线用哪个 CAN 驱动；options 是打开总线时的额外参数
+        （Windows 上 gs_usb 的整数通道号就放在这里），都按总线标签索引。
         """
         self.calibration = calibration
         self.timeout = timeout
         # 每个总线用哪个 CAN 驱动：Linux 是 socketcan，Windows 看适配器
         self._interface = dict(interface or {})
+        self._options = {k: dict(v) for k, v in (options or {}).items()}
 
         # 按电机表顺序排列，保证录制/回放每一列的含义固定
         self._names = config.sort_names([name for names in setup.values() for name in names])
@@ -103,8 +108,12 @@ class Arm:
                 }
                 # 库的构造和 connect() 会往 stdout 打大段标定字典，这里统一静音
                 driver = self._interface.get(channel) or config.default_can_interface()
+                open_kwargs = self._options.get(channel) or {"channel": channel}
                 with quiet():
-                    bus = ArmBus(channel, motors, self.calibration, interface=driver)
+                    bus = ArmBus(
+                        channel, motors, self.calibration,
+                        interface=driver, open_kwargs=open_kwargs,
+                    )
                     bus.connect()
                 self._buses[channel] = bus
                 self._names_on[channel] = list(names)

@@ -114,21 +114,26 @@ Windows 没有 socketcan，改用 python-can 的厂商驱动。程序启动时�
 |---|---|---|
 | PEAK PCAN-USB | `pcan` | 装 PCAN-Basic |
 | 周立功 CANalyst-II | `canalystii` | 装厂家驱动 |
-| CANable / slcan 串口 | `slcan` | 需要指定 COM 口 |
-| gs_usb / candlelight | `gs_usb` | 免驱（WinUSB） |
+| CANable / slcan 串口 | `slcan` | 需要指定 COM 口（要 pyserial） |
+| **gs_usb / candleLight / CANable** | `gs_usb` | 免驱（WinUSB），需要 `pyusb` + `gs_usb` + `libusb-1.0.dll` |
 | Kvaser / Vector / SYSTEC / IXXAT | 同名 | 装厂家驱动 |
+
+> `gs_usb` 这一类适配器 python-can 自己**枚举不到**（它没实现 `detect_available_configs`），
+> 程序会另外用 pyusb 扫 USB 把它们列出来；`pyusb` / `gs_usb` / `libusb-package` 已写进依赖清单。
 
 如果自动识别不理想，手动指定：
 
 ```bat
 windows\2-启动.bat --interface pcan
 windows\2-启动.bat --interface slcan --channels COM3,COM4
+windows\2-启动.bat --channels "candleLight#0","candleLight#3"
 ```
 
-或者用命令行看一眼当前能认出什么：
+或者用命令行看一眼当前能认出什么（会顺带试开每一条总线）：
 
 ```bat
-.venv\Scripts\python.exe app\discover.py --interface pcan
+.venv\Scripts\python.exe app\discover.py
+.venv\Scripts\python.exe app\main.py --diagnose     # 完整环境体检
 ```
 
 ### 常见问题（Windows）

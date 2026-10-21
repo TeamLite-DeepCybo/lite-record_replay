@@ -30,8 +30,77 @@ from datetime import datetime
 from pathlib import Path
 from tkinter import messagebox, ttk
 
-from bhl import config, detect, paths, motion as motion_mod, storage
+from bhl import config, detect, libusb, paths, motion as motion_mod, storage
 from bhl.arm import Arm
+from bhl.bus import release_usb
+
+
+def _enable_dpi_awareness() -> None:
+    """Windows：把进程设为 DPI 感知，必须在创建任何 Tk 窗口之前调用。
+
+    PyInstaller 打出来的 exe 清单里默认**没有** dpiAware，Windows 会把整个窗口
+    按显示缩放比例（125% / 150%）做位图拉伸 —— 模糊、发虚、控件尺寸错乱，
+    就是"界面严重变形"的来源。改成 DPI 感知后窗口按真实像素渲染。
+    """
+    if not sys.platform.startswith("win"):
+        return
+    try:
+        import ctypes
+
+        ctypes.windll.shcore.SetProcessDpiAwareness(2)   # PER_MONITOR_DPI_AWARE
+    except Exception:  # noqa: BLE001
+        try:
+            import ctypes
+
+            ctypes.windll.user32.SetProcessDPIAware()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def _normalize_font_scale(root: tk.Tk) -> None:
+    """把 Tk 的"点→像素"换算固定成 96dpi，让 Windows 界面和 Linux 版逐像素一致。
+
+    DPI 感知打开后，Windows 的 125%/150% 系统缩放会让 Tk 按 120/144dpi 放大字号，
+    整个界面比 Ubuntu 版胖一圈；固定回 96dpi 后两边的字号、间距完全一样。
+    """
+    if not sys.platform.startswith("win"):
+        return
+    try:
+        root.tk.call("tk", "scaling", 96.0 / 72.0)
+    except tk.TclError:
+        pass
+
+
+_SINGLE_INSTANCE_MUTEX = None
+
+
+def acquire_single_instance() -> bool:
+    """Windows：同一时间只允许一个本程序实例。
+
+    candleLight 这类 USB-CAN 是**独占设备**：两个实例（比如 GUI + 另开的
+    `--diagnose`，或者本程序 + 别人的上位机）同时去开同一只棒子，会把
+    candle 原生库卡在驱动调用里 —— 进程既不能退出也杀不掉，USB 句柄一直被攥着，
+    之后所有程序都报 `access denied`，只能拔插/重启才能恢复。
+    所以这里加一个全局互斥量，第二个实例直接退出。
+    """
+    global _SINGLE_INSTANCE_MUTEX
+    if not sys.platform.startswith("win"):
+        return True
+    try:
+        import ctypes
+
+        kernel32 = ctypes.windll.kernel32
+        # 名字带 Global\ 才能跨会话/跨用户互斥
+        handle = kernel32.CreateMutexW(None, False, "Global\\LiteRecordReplay-USB-CAN")
+        if not handle:
+            return True                     # 建不出来就放行，别把程序锁死
+        if kernel32.GetLastError() == 183:  # ERROR_ALREADY_EXISTS
+            return False
+        _SINGLE_INSTANCE_MUTEX = handle     # 持有到进程退出
+        return True
+    except Exception:  # noqa: BLE001
+        return True
+
 
 # ======================================================================
 # 外观
@@ -349,13 +418,31 @@ class App:
     # ==================================================================
     def _build(self) -> None:
         self.root.title(f"Prime Lite · 动作录制 / 回放　v{display_version()}")
+        _normalize_font_scale(self.root)   # 必须在读字号/量屏幕之前，与 Linux 版一致
         self.fonts = _setup_theme(self.root)
 
         screen_width = self.root.winfo_screenwidth()
         screen_height = self.root.winfo_screenheight()
 
-        width = min(WINDOW_SIZE[0], max(800, screen_width - 80))
-        height = min(WINDOW_SIZE[1], max(700, screen_height - 100))
+        # 窗口钳制用的"可用像素"。字号换算固定在 96dpi 后（_normalize_font_scale），
+        # 1 个 Tk 像素 = 系统缩放倍数 个物理像素；winfo 报的屏幕是 Tk 像素，
+        # 但窗口的物理宽度 = Tk像素 × 缩放倍数，直接拿 winfo 去钳会顶出屏幕。
+        # 所以 Windows 上改用 物理分辨率 / 缩放倍数 来算，保证窗口永远落在屏幕里，
+        # 并且整块界面（字、间距、控件）同比例缩放，和 Ubuntu 版一致。
+        fit_width, fit_height = screen_width, screen_height
+        if sys.platform.startswith("win"):
+            try:
+                import ctypes
+
+                dpi = max(96, int(ctypes.windll.user32.GetDpiForSystem()))
+                zoom = dpi / 96.0
+                fit_width = max(640, int(ctypes.windll.user32.GetSystemMetrics(0) / zoom) - 80)
+                fit_height = max(480, int(ctypes.windll.user32.GetSystemMetrics(1) / zoom) - 100)
+            except Exception:  # noqa: BLE001 - 拿不到就用 winfo 的值兜底
+                pass
+
+        width = max(640, min(WINDOW_SIZE[0], fit_width))
+        height = max(480, min(WINDOW_SIZE[1], fit_height))
         # 矮屏（机器人自带屏等）去掉小节标题，把高度让给日志
         self._compact = height < 800
 
@@ -732,12 +819,57 @@ class App:
 
     def _worker_scan(self, forced, robot_type: str) -> None:
         label = config.ROBOT_TYPE_LABELS.get(robot_type, robot_type)
+        was_connected = self.arm is not None
         try:
+            # Windows 的 USB-CAN 是**独占句柄**：还连着的时候再枚举，
+            # 正在用的那条总线会被 candle 库当成"不可用"漏掉（表现为
+            # 第二次扫描左臂"消失"、扫描失败）。所以扫描前必须先断开。
+            if self.arm is not None:
+                self._log_safe("扫描前先断开当前连接（USB-CAN 是独占句柄）…")
+                try:
+                    self.arm.close()
+                except Exception:  # noqa: BLE001
+                    pass
+                self.arm = None
+                self.last_setup = None
+                self._log_safe("已断开", "ok")
+
             self._log_safe(f"扫描电机（机型：{label}）…")
             setup = detect.scan(
                 forced=forced, expect=robot_type, interface=self.interface, on_progress=self._log_safe
             )
             self._log_safe(setup.describe(), "warn" if setup.missing else "ok")
+
+            # 把所有**没有电机**的 CAN 口挨个报一遍状态：
+            # 让"哪个口开着、哪个口没插线、哪个口插了但对面没上电"一目了然。
+            try:
+                empty = [
+                    t for t in detect.list_targets(self.interface)
+                    if t.label not in setup.channels
+                ]
+                if empty:
+                    stats = detect.sniff_many(empty, seconds=0.5)
+                    self._log_safe("其它 CAN 口状态：")
+                    for t in empty:
+                        counts, errors = stats.get(t.label, ({}, 0))
+                        if counts:
+                            self._log_safe(
+                                f"  {t.label}：有数据帧（{sum(counts.values())} 帧）但无电机应答",
+                                "warn",
+                            )
+                        elif errors:
+                            self._log_safe(
+                                f"  {t.label}：总线报错（{errors} 个错误帧）——"
+                                "电缆插着，但对面没上电 / 缺 120Ω 终端电阻",
+                                "warn",
+                            )
+                        else:
+                            self._log_safe(f"  {t.label}：静音（这个口上没插电缆）", "dim")
+            except Exception:  # noqa: BLE001 - 只是附加信息，失败不影响扫描结果
+                pass
+
+            if was_connected:
+                self._log_safe("扫描完成。点「重新连接」即可恢复连接。", "info")
             self._post(("scan", (setup, robot_type)))
         except Exception as exc:
             traceback.print_exc()
@@ -846,6 +978,38 @@ class App:
             self._log_safe("CAN 口就绪", "ok")
 
             self._log_safe(f"扫描电机（机型：{config.ROBOT_TYPE_LABELS.get(robot_type, robot_type)}）…")
+
+            def explain(exc: Exception) -> Exception:
+                """把"一个电机都没扫到"落到具体是哪一层坏了。"""
+                targets = detect.list_targets(self.interface)
+                if not targets:
+                    return exc          # 连适配器都没有，原话更有用
+                detail = "，".join(target.label for target in targets)
+                self._log_safe(f"已识别到 {len(targets)} 条 CAN 总线：{detail}", "info")
+                sniffed = detect.sniff_many(targets, seconds=0.5)
+                silent, erroring = [], []
+                for t in targets:
+                    counts, errors = sniffed.get(t.label, ({}, 0))
+                    if counts:
+                        continue
+                    (erroring if errors else silent).append(t.label)
+                if erroring:
+                    self._log_safe(
+                        "这些总线在报错（电缆插着但对面没上电/没终端电阻）："
+                        + "，".join(erroring),
+                        "warn",
+                    )
+                if silent:
+                    self._log_safe(
+                        "这些总线完全静音（这条口上没插电缆）：" + "，".join(silent), "warn"
+                    )
+                return RuntimeError(
+                    f"CAN 适配器工作正常（{len(targets)} 条都能打开），但没有电机应答。\n"
+                    "请确认：机器人已上电、CAN 线接好（两端 120Ω 终端电阻）、"
+                    "电机 ID 与 config.py 一致。\n"
+                    "更细的信息跑一次：LiteRecordReplay.exe --diagnose"
+                )
+
             try:
                 setup = detect.scan(
                     forced=forced_channels,
@@ -853,19 +1017,26 @@ class App:
                     interface=self.interface,
                     on_progress=self._log_safe,
                 )
-            except detect.DetectError:
-                # 一个电机都没扫到：USB-CAN 常常要在适配器重新上电后重新配置一次
+            except detect.DetectError as first:
+                if not sys.platform.startswith("linux"):
+                    # Windows 没有 canup.sh 这一套，重扫一遍没意义
+                    raise explain(first) from first
+
+                # Linux 下 USB-CAN 常常要在适配器重新上电后重新配置一次
                 self._log_safe("一个电机都没扫到，重新配置 CAN 口后再试一次 …", "warn")
                 _ok, output = detect.bring_up_can(on_progress=self._log_safe)
                 for line in output.splitlines():
                     if line.strip():
                         self._log_safe("  " + line.strip(), "dim")
-                setup = detect.scan(
-                    forced=forced_channels,
-                    expect=robot_type,
-                    interface=self.interface,
-                    on_progress=self._log_safe,
-                )
+                try:
+                    setup = detect.scan(
+                        forced=forced_channels,
+                        expect=robot_type,
+                        interface=self.interface,
+                        on_progress=self._log_safe,
+                    )
+                except detect.DetectError as exc:
+                    raise explain(exc) from exc
 
             self._log_safe(setup.describe(), "warn" if setup.missing else "info")
             if setup.missing:
@@ -882,7 +1053,12 @@ class App:
                     f"这些关节没有标定偏移，按 0 处理：{', '.join(missing)}", "warn"
                 )
 
-            arm = Arm(setup.channels, calibration, interface=setup.interface)
+            arm = Arm(
+                setup.channels,
+                calibration,
+                interface=setup.interface,
+                options=setup.open_options,
+            )
             self.arm = arm
             self.last_setup = setup
             self._log_safe("已连接 · " + arm.summary(), "ok")
@@ -1141,11 +1317,146 @@ class App:
 # ======================================================================
 # 命令行
 # ======================================================================
+def diagnose_report() -> str:
+    """把 CAN 相关的环境一次说清楚，方便排障。返回报告正文。"""
+    import platform
+    import struct
+
+    lines: list[str] = []
+
+    def put(text: str = "") -> None:
+        lines.append(text)
+
+    put(f"Lite 动作录制 / 回放 {display_version()}")
+    put(f"平台      : {platform.platform()}（{platform.machine()}，{struct.calcsize('P') * 8} bit）")
+    put(f"Python    : {platform.python_version()}  {sys.executable}")
+    put(f"运行方式  : {'打包 exe' if getattr(sys, 'frozen', False) else '源码'}")
+    put(f"程序目录  : {ROOT_DIR}")
+    put()
+    put("== 依赖 ==")
+    for module in ("numpy", "can", "robstride_dynamics", "candle_api", "candle", "usb", "gs_usb", "libusb_package"):
+        try:
+            imported = __import__(module)
+            version = getattr(imported, "__version__", "")
+            put(f"  [ok]   {module} {version}".rstrip())
+        except Exception as exc:  # noqa: BLE001
+            put(f"  [--]   {module}: {exc}")
+    put(f"  [..]   libusb: {libusb.describe()}")
+    put()
+    put("== CAN 适配器 ==")
+
+    targets: list = []
+    try:
+        targets = detect.list_targets()
+    except Exception as exc:  # noqa: BLE001
+        put(f"  枚举失败：{exc}")
+    if not targets:
+        put("  没有检测到（Windows 看下面的提示；Linux 先跑 bash app/canup.sh）")
+    for target in targets:
+        put(f"  {target.label:26s} 驱动 {target.driver:12s} channel={target.channel!r}")
+    for item in detect.missing_components():
+        put(f"  ! {item}")
+
+    if targets:
+        put()
+        put("== 扫描电机（每条总线最多 1 秒）==")
+        matched: set[str] = set()
+        try:
+            setup = detect.scan(timeout=0.05, on_progress=lambda text: put(f"  {text}"))
+        except Exception as exc:  # noqa: BLE001
+            put(f"  {exc}")
+        else:
+            put("  " + setup.describe().replace("\n", "\n  "))
+            matched = set(setup.channels)
+
+        # 只对"没有电机"的总线做静默监听，免得每台都多花 1.5 秒
+        quiet_targets = [target for target in targets if target.label not in matched]
+        if quiet_targets:
+            put()
+            put("== 监听这些没有应答的总线 1.5 秒（只听不说）==")
+            all_counts = detect.sniff_many(quiet_targets)
+            for target in quiet_targets:
+                counts, errors = all_counts.get(target.label, ({}, 0))
+                total = sum(counts.values())
+                if errors and errors >= total:
+                    # 电缆插着、但对面没有任何节点应答：适配器自己在刷错误帧
+                    put(
+                        f"  {target.label:26s} 总线在报错（{errors} 个错误帧，0 帧正常数据）"
+                    )
+                    put("      → 电缆插着，但对面没上电 / 缺 120Ω 终端电阻 / CAN_H-CAN_L 接反")
+                    continue
+                if not total and not errors:
+                    put(f"  {target.label:26s} 一点动静都没有（这条口上没插电缆？）")
+                    continue
+                if errors:
+                    put(f"  {target.label:26s} {total} 帧数据 + {errors} 个错误帧")
+                else:
+                    put(f"  {target.label:26s} {total} 帧数据")
+                for arb, count in sorted(counts.items(), key=lambda kv: -kv[1])[:6]:
+                    put(
+                        f"      id=0x{arb:08x} ×{count:<4d}"
+                        f" 通信类型={(arb >> 24) & 0x1F:2d} 电机ID≈{(arb >> 8) & 0xFF}"
+                    )
+    return "\n".join(lines) + "\n"
+
+
+def run_can_scan_worker() -> int:
+    """`--can-scan-worker`（隐藏参数）：被自己以子进程方式调用。
+
+    窗口程序（PyInstaller --windowed）里 sys.stdin/stdout 是 None，
+    但子进程的 stdin/stdout 是我们用管道接好的，这里手动把它们接回标准流，
+    然后把活转给 can_scan.main_worker()。
+    """
+    import io
+
+    try:
+        if sys.stdin is None:
+            sys.stdin = io.TextIOWrapper(os.fdopen(0, "rb"), encoding="utf-8")
+        if sys.stdout is None:
+            sys.stdout = io.TextIOWrapper(os.fdopen(1, "wb"), encoding="utf-8")
+        if sys.stderr is None:
+            sys.stderr = io.TextIOWrapper(os.fdopen(2, "wb"), encoding="utf-8")
+    except OSError:
+        pass
+
+    import can_scan
+
+    return can_scan.main_worker()
+
+
+def run_diagnose() -> int:
+    """`--diagnose`：打印报告并写到程序目录的 can-diagnose.txt。
+
+    打包成 exe 后是窗口程序、没有控制台，所以报告同时落一份文件，
+    出问题时把这个文件发出来就行。
+    """
+    try:
+        report = diagnose_report()
+    except Exception:  # noqa: BLE001
+        report = "诊断失败：\n" + traceback.format_exc()
+    try:
+        print(report)
+    except Exception:  # noqa: BLE001 - 窗口程序里 stdout 可能是空的
+        pass
+    target = Path(ROOT_DIR) / "can-diagnose.txt"
+    try:
+        target.write_text(report, encoding="utf-8")
+    except OSError:
+        pass
+    else:
+        try:
+            print(f"报告已写入 {target}")
+        except Exception:  # noqa: BLE001
+            pass
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Prime Lite 双臂机器人 动作录制/回放")
     parser.add_argument("--channels", "-c", default="", help="手动指定左右臂 CAN 口，例如 can2,can1（默认自动识别）")
     parser.add_argument("--import-legacy", default="", metavar="DIR", help="把旧版 .npy 录制批量导入后退出")
     parser.add_argument("--list", action="store_true", help="列出现有录制后退出")
+    parser.add_argument("--diagnose", action="store_true", help="打印 CAN 环境诊断后退出（结果同时写入 can-diagnose.txt）")
     parser.add_argument("--version", action="version", version=f"Prime Lite 动作录制/回放 v{display_version()}")
     parser.add_argument(
         "--interface",
@@ -1159,7 +1470,22 @@ def main() -> int:
         choices=config.ROBOT_TYPES,
         help="机器人类型：auto 自动识别（默认）/ gripper 有夹爪 / no_gripper 无夹爪",
     )
+    parser.add_argument(
+        "--can-scan-worker",
+        action="store_true",
+        help=argparse.SUPPRESS,   # 子进程入口：碰 candle 硬件的操作在子进程里做，卡死可杀
+    )
     args = parser.parse_args()
+
+    if args.can_scan_worker:
+        return run_can_scan_worker()
+
+    if args.diagnose:
+        # 诊断也会去开设备，同样受单实例限制，免得和正在跑的 GUI 抢棒子
+        if not acquire_single_instance():
+            print("已经有一个 LiteRecordReplay 在运行，先关掉它再诊断（USB-CAN 是独占设备）")
+            return 2
+        return run_diagnose()
 
     if args.import_legacy:
         saved, problems = storage.import_legacy_dir(Path(args.import_legacy))
@@ -1178,6 +1504,24 @@ def main() -> int:
 
     forced = detect.parse_channels(args.channels) if args.channels else None
 
+    if not acquire_single_instance():
+        # 两个实例同时抢 USB-CAN 会把 candle 原生库卡死（进程杀不掉、设备一直被占）
+        try:
+            _enable_dpi_awareness()
+            _warn = tk.Tk()
+            _warn.withdraw()
+            messagebox.showwarning(
+                "已经有实例在运行",
+                "LiteRecordReplay 已经打开了一个窗口。\n\n"
+                "USB-CAN 适配器是独占设备，两个实例同时开会把设备卡死，"
+                "需要拔插适配器才能恢复。请先关掉原来那个窗口。",
+            )
+            _warn.destroy()
+        except Exception:  # noqa: BLE001
+            print("已经有一个实例在运行，请先关掉它。", file=sys.stderr)
+        return 2
+
+    _enable_dpi_awareness()   # 必须在 tk.Tk() 之前
     try:
         root = tk.Tk()
     except tk.TclError as exc:

@@ -53,6 +53,15 @@ jobs:
           PYTHONUTF8: "1"
         run: python -c "import bhl, numpy, can, robstride_dynamics, tkinter; from bhl import config; print('imports ok, motors =', len(config.MOTORS))"
 
+      - name: USB-CAN import check
+        working-directory: app
+        env:
+          PYTHONUTF8: "1"
+        run: |
+          # candleLight / CANable 走 gs_usb 后端：pyusb + gs_usb 包 + libusb-1.0.dll
+          python -c "import usb, usb.backend.libusb1, gs_usb, libusb_package; print('usb stack ok')"
+          python -c "import bhl.libusb as l; print('libusb backend:', l.ensure(), l.describe())"
+
       - name: Build single-file exe
         env:
           PYTHONUTF8: "1"
@@ -60,6 +69,13 @@ jobs:
           # 注意：--specpath 会让 .spec 里的相对路径按 spec 所在目录解析，
           # 所以输入路径一律用绝对路径，避免 "Unable to find app/assets"。
           $root = (Get-Location).Path
+          # python-can 的后端是按名字动态 import 的，PyInstaller 静态分析看不到，
+          # 必须显式 hidden-import，否则运行时 "Cannot import module can.interfaces.gs_usb"
+          $backends = @("gs_usb","pcan","canalystii","slcan","serial","kvaser","vector",
+                        "systec","ixxat","usb2can","cantact","socketcan","socketcand",
+                        "udp_multicast","virtual")
+          $hidden = @()
+          foreach ($b in $backends) { $hidden += @("--hidden-import", "can.interfaces.$b") }
           python -m PyInstaller `
             --noconfirm --clean --windowed --onefile `
             --name "LiteRecordReplay" `
@@ -67,6 +83,10 @@ jobs:
             --add-data "$root/app/assets;assets" `
             --add-data "$root/app/calibration.json;." `
             --paths "$root/app" `
+            --hidden-import "usb.backend.libusb1" `
+            @hidden `
+            --collect-submodules gs_usb `
+            --collect-all libusb_package `
             --distpath "$root/dist" --workpath "$root/build" --specpath "$root/build" `
             "$root/app/main.py"
 
@@ -82,6 +102,20 @@ jobs:
           $v = Start-Process -FilePath $exe -ArgumentList "--version" -PassThru -Wait
           if ($v.ExitCode -ne 0) { throw "--version exited with $($v.ExitCode)" }
           Write-Host "version check passed"
+
+          # 硬校验：--diagnose 必须写出报告，且 python-can 的厂商后端真的能用
+          # （之前 exe 缺 can.interfaces.gs_usb 就是这么漏掉的）
+          Remove-Item "dist/can-diagnose.txt" -ErrorAction SilentlyContinue
+          $d = Start-Process -FilePath $exe -ArgumentList "--diagnose" -PassThru -Wait
+          if ($d.ExitCode -ne 0) { throw "--diagnose exited with $($d.ExitCode)" }
+          if (-not (Test-Path "dist/can-diagnose.txt")) { throw "--diagnose wrote no report" }
+          $report = Get-Content "dist/can-diagnose.txt" -Raw
+          Write-Host $report
+          foreach ($needle in @("gs_usb", "libusb", "CAN 适配器")) {
+            if ($report -notmatch [regex]::Escape($needle)) { throw "report is missing '$needle'" }
+          }
+          if ($report -match "No module named 'can\.interfaces") { throw "a python-can backend is missing from the bundle" }
+          Write-Host "diagnose check passed"
 
           # 软校验：GUI 能起来并活过 8 秒（CI 无交互桌面时可能起不来，不判失败）
           $g = Start-Process -FilePath $exe -PassThru

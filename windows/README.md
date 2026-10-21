@@ -68,23 +68,72 @@ Windows 没有 socketcan，改用 python-can 的厂商驱动。程序启动时�
 
 | 适配器 | 驱动名 | 备注 |
 |---|---|---|
+| **candleLight / CANable / canable2** | `candle` | 开源固件 USB-CAN，**首选**（`python-can-candle` 插件） |
+| 同上的兜底 | `gs_usb` | 靠 pyusb + libusb，Windows 上发帧会超时，只在没有 candle 时用 |
 | PEAK PCAN-USB | `pcan` | 装 PCAN-Basic 驱动 |
 | 周立功 CANalyst-II | `canalystii` | 装厂家驱动 |
-| CANable / slcan 串口 | `slcan` | 需要指定 COM 口 |
-| gs_usb / candlelight | `gs_usb` | 免驱（WinUSB） |
+| CANable / slcan 串口 | `slcan` | 需要指定 COM 口（要 pyserial） |
 | Kvaser / Vector / SYSTEC / IXXAT | 同名 | 装厂家驱动 |
+
+### candleLight 这类棒子：为什么必须用 `candle`
+
+同一根棒子有两条软件路可走，差别很大：
+
+| 后端 | 枚举 | 发帧 | 结论 |
+|---|---|---|---|
+| `candle`（`python-can-candle`） | 按**序列号**列出设备 | 正常，实测 16/16 电机全在 | ✅ 默认走这条 |
+| `gs_usb`（pyusb + libusb） | python-can 根本没实现枚举 | Windows 上每帧都 1 秒 USB 超时 | ⚠ 只能兜底 |
+
+`candle` 的通道长这样：`"0038003E5547570820383634:0"`（**序列号:通道号**），
+所以换 USB 口、换枚举顺序都不会认错设备。程序会自动把这些整理成好认的标签：
+
+```
+candleLight#0 (00380020)   驱动 candle   channel='003800205547570820383634:0'
+candleLight#1 (0038003E)   驱动 candle   channel='0038003E5547570820383634:0'
+```
+
+需要哪几条就用 `--channels` 点名（也可以用序列号或 `candle:0` 这种别名）：
+
+```bat
+LiteRecordReplay.exe --channels "candleLight#0","candleLight#1"
+```
+
+### 先跑一次体检
+
+```bat
+.venv\Scripts\python.exe app\main.py --diagnose
+```
+
+它会列出：依赖版本、`candle` / `libusb` 是否可用、枚举到的每个适配器（标签 / 驱动 / 通道号）、
+扫描电机时每条总线是"发现 N 个""可以打开但没有应答"还是"用不了"，
+并对没有应答的总线**静默监听 1.5 秒**。exe 版对应：
+
+```bat
+LiteRecordReplay.exe --diagnose          :: 结果同时写到 exe 旁边的 can-diagnose.txt
+```
+
+这份报告能直接把问题定位到某一层：
+
+| 报告里看到 | 说明 |
+|---|---|
+| `没有检测到 CAN 适配器` | 驱动 / 依赖这一层（缺 `python-can-candle` 最常见） |
+| `打开超时` / `Cannot open device` / `Access denied` | 适配器被**别的程序或僵尸进程**占着（USB 句柄是独占的） |
+| `用不了：The message could not be sent` | 只有 gs_usb 会这样：帧发出去没人 ACK 或后端不可用 |
+| `可以打开，但没有电机应答` + 监听全静音 | 机械臂没上电 / CAN 线没接 / 没终端电阻 |
+| 有帧、但扫描不到电机 | 电机 ID 与 `config.py` 不一致，或不是 Robstride 电机 |
 
 手动指定（多数情况不需要）：
 
 ```bat
 2-启动.bat --interface pcan
 2-启动.bat --interface slcan --channels COM3,COM4
+2-启动.bat --channels "candleLight#0","candleLight#3"
 ```
 
-看一眼当前认出了什么：
+看一眼当前认出了什么（会顺带试开每一条总线）：
 
 ```bat
-.venv\Scripts\python.exe app\discover.py --interface pcan
+.venv\Scripts\python.exe app\discover.py
 ```
 
 ## 常见问题
@@ -107,12 +156,26 @@ Windows 没有 socketcan，改用 python-can 的厂商驱动。程序启动时�
 `.venv\Scripts\python.exe` 是标准 Python 虚拟环境里的解释器，部分杀软会误报，
 加白名单即可。
 
-**扫描不到电机**
+**日志里说"没有检测到可用的 CAN 适配器"**
 
-1. 确认 USB-CAN 适配器在设备管理器里没有黄色感叹号（驱动装好）；
-2. 跑 `.venv\Scripts\python.exe app\discover.py`，看有没有列出适配器；
-3. 总线波特率必须是 **1 Mbps**（RobStride 电机默认），部分适配器软件里要单独设；
-4. 确认机器人已经上电。
+跑 `--diagnose`，看 `== 依赖 ==` 里 `usb` / `gs_usb` / `libusb_package` 三项和
+`libusb:` 那一行：
+
+- 少了 `usb` 或 `gs_usb` → 重跑 `1-安装.bat`（依赖清单已经补上这两个包）；
+- `libusb: 找不到 libusb-1.0.dll` → `pip install libusb-package`，或把 DLL 放到程序目录；
+- 三项都在但还是没有 → 设备没绑 WinUSB。用 [Zadig](https://zadig.akeo.ie/) 把
+  `candleLight USB to CAN adapter` 的驱动换成 WinUSB。
+
+**能识别适配器，但扫描不到电机**
+
+1. 先看 `--diagnose` 里 `== 试开每条总线 ==` 是不是每条"可以打开"；
+2. 再看 `== 监听每条总线 1.5 秒 ==`：
+   - **全部"一点动静都没有"** → 机械臂没上电，或者 CAN 线 / 供电没接上（软件已经没问题了）；
+   - **有的总线有帧，有的没有** → 线接在"有帧"的那条上，用 `--channels` 只扫它；
+3. 确认机器人已上电、CAN 线（含 120Ω 终端电阻）接好；
+4. 总线波特率必须是 **1 Mbps**（RobStride 电机默认）；
+4. 日志里出现 `CanOperationError: The message could not be sent` 通常表示
+   **这一帧发出去没人应答**（机器人没上电 / 线没接 / 没终端电阻），不是程序问题。
 
 **想要一个真正的 .exe（单文件、双击即用）**
 

@@ -23,8 +23,10 @@ def show_buses(interface: str) -> None:
         targets = detect.list_targets(interface)
         if not targets:
             print("  没有检测到适配器（检查 USB-CAN 驱动，或用 --interface 指定驱动）")
-        for label, _channel, driver in targets:
-            print(f"  {label:24s} 驱动 {driver}")
+            for item in detect.missing_components():
+                print(f"    - {item}")
+        for target in targets:
+            print(f"  {target.label:26s} 驱动 {target.driver:12s} channel={target.channel!r}")
         return
 
     print("== CAN 口状态 ==")
