@@ -13,7 +13,6 @@
 
 from __future__ import annotations
 
-import math
 import threading
 import time
 from dataclasses import dataclass, field
@@ -252,28 +251,10 @@ def replay(
 
     # 2) 软启动：从当前姿态平滑走到第一帧
     #
-    # 先处理"绕圈"：RobStride 的位置在 ±π 附近会翻界，同一个物理角度
-    # 可能差出整圈（实测 right_shoulder_yaw 差 +6.09 rad ≈ 2π）。
-    # 如果减去整圈后落回关节行程内，就认为是绕圈而不是真的差了一整圈，
-    # 把这段录制整体平移过去（否则会把它当成"零位错了"直接拒绝回放）。
-    wrapped: dict[int, float] = {}
-    for index, name in enumerate(arm.joint_names):
-        spec = config.MOTORS_BY_NAME[name]
-        span = spec.upper - spec.lower
-        raw = float(positions[0, index] - arm.pos[index])
-        turns = round(raw / (2.0 * math.pi))
-        if turns:
-            adjusted = raw - turns * 2.0 * math.pi
-            if abs(adjusted) <= span:
-                wrapped[index] = -turns * 2.0 * math.pi
-                notes.append(
-                    f"{name} 读数绕了 {turns:+d} 圈（{raw:+.2f} → {adjusted:+.2f} rad），已按同角度处理"
-                )
-    if wrapped:
-        positions = positions.copy()
-        for index, offset in wrapped.items():
-            positions[:, index] = positions[:, index] + offset
-
+    # 注意：这里**不做整圈归一化**。RobStride 报的是多圈绝对位置，录制里存的
+    # 就是电机当时的真实读数，差一个 2π 就是真的差了一整圈（比如夹爪从闭合
+    # 转到张开）。曾经试过"差接近整圈就平移轨迹"，结果把夹爪的目标改到差一圈
+    # 的位置，动作方向整个反掉 —— 绝对不能这么干。
     gaps = {
         name: float(positions[0, index] - arm.pos[index])
         for index, name in enumerate(arm.joint_names)
