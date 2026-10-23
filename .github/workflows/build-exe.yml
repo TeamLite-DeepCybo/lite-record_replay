@@ -146,8 +146,10 @@ jobs:
           $name = "LiteRecordReplay-$ver-${{ matrix.arch }}"
           $dest = "packaging/$name"
           New-Item -ItemType Directory -Force -Path $dest | Out-Null
-          # 整体搬目录版：exe + _internal/（启动不解压，秒开）
-          Copy-Item "dist/LiteRecordReplay/*" $dest -Recurse -Force
+          # 只搬程序本体：exe + _internal（冒烟测试会在 dist 目录里留下
+          # can-diagnose.txt / worker-*.txt 之类的调试文件，不能发出去）
+          Copy-Item "dist/LiteRecordReplay/LiteRecordReplay.exe" $dest
+          Copy-Item "dist/LiteRecordReplay/_internal" $dest -Recurse
           Copy-Item "app/calibration.json" $dest -ErrorAction SilentlyContinue
           New-Item -ItemType Directory -Force -Path "$dest/data/motions" | Out-Null
           # 用 ASCII 文件名：Compress-Archive 会用系统代码页存中文名，英文 Windows 上会乱码
