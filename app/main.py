@@ -870,6 +870,16 @@ class App:
             self._progress_mode = "determinate"
         self.progress.configure(mode="determinate", maximum=max(1.0, float(total)), value=float(done))
 
+    # ---- 后台线程用的阶段进度（和录放共用同一条进度条）------------------
+    def _progress_stage(self, done: float, total: float = 1.0) -> None:
+        """后台线程调用：把 0..total 的阶段进度丢给界面线程。"""
+        self._post(("progress", (float(done), float(total))))
+
+    def _scan_step(self, done: int, total: int) -> None:
+        """扫描时每扫完一条总线推进一格：0.15（CAN 检查完）→ 0.85（扫完）。"""
+        ratio = 0.0 if total <= 0 else min(1.0, max(0.0, done / total))
+        self._progress_stage(0.15 + 0.70 * ratio, 1.0)
+
     # ---- 状态机 ------------------------------------------------------
     def _apply_mode(self, mode: str) -> None:
         self.mode = mode
@@ -949,6 +959,7 @@ class App:
         label = config.ROBOT_TYPE_LABELS.get(robot_type, robot_type)
         was_connected = self.arm is not None
         try:
+            self._progress_stage(0.02)
             # Windows 的 USB-CAN 是**独占句柄**：还连着的时候再枚举，
             # 正在用的那条总线会被 candle 库当成"不可用"漏掉（表现为
             # 第二次扫描左臂"消失"、扫描失败）。所以扫描前必须先断开。
@@ -963,6 +974,7 @@ class App:
                 self._log_safe("已断开", "ok")
 
             self._log_safe(f"扫描电机（机型：{label}）…")
+            self._progress_stage(0.10)
 
             # 只探"记住的那两只"（不碰其它口）；只有在它俩找不到电机时，
             # 才退回全量扫描去重新发现（换了适配器/换 USB 口的场景）。
@@ -983,6 +995,7 @@ class App:
                     # Windows 上枚举要逐个打开设备读序列号，很贵。
                     refresh=self._can_lost,
                     on_progress=self._log_safe,
+                    on_step=self._scan_step,
                 )
             except detect.DetectError:
                 if candidates is None:
@@ -994,6 +1007,7 @@ class App:
                     interface=self.interface,
                     refresh=True,
                     on_progress=self._log_safe,
+                    on_step=self._scan_step,
                 )
             self._log_safe(setup.describe(), "warn" if setup.missing else "ok")
 
@@ -1037,6 +1051,7 @@ class App:
 
             if was_connected:
                 self._log_safe("扫描完成，正在按结果重新连接 …", "info")
+            self._progress_stage(0.90)
             self._post(("scan", (setup, robot_type)))
             # 扫完直接接上，不用再点「重新连接」
             self._activate(setup, robot_type)
@@ -1131,6 +1146,7 @@ class App:
     # ==================================================================
     def _connect(self, forced_channels: dict[str, str] | None, robot_type: str = "auto") -> None:
         try:
+            self._progress_stage(0.05)
             self._log_safe("检查 CAN 口 …")
             channels = list(dict.fromkeys(forced_channels.values())) if forced_channels else None
 
@@ -1145,6 +1161,7 @@ class App:
                 self._post(("mode", "idle"))
                 return
             self._log_safe("CAN 口就绪", "ok")
+            self._progress_stage(0.15)
 
             # 物理插着几只 vs candle 能认出几只：少掉的那几只被别的进程占着
             # （最常见的是上一次卡死的 scan worker）。实测这种状态下再扫，
@@ -1229,6 +1246,7 @@ class App:
                     expect=robot_type,
                     interface=self.interface,
                     on_progress=self._log_safe,
+                    on_step=self._scan_step,
                 )
                 # 记住这次真正认到电机的通道，下次就只碰它们
                 used = [
@@ -1255,10 +1273,12 @@ class App:
                         expect=robot_type,
                         interface=self.interface,
                         on_progress=self._log_safe,
+                        on_step=self._scan_step,
                     )
                 except detect.DetectError as exc:
                     raise explain(exc) from exc
 
+            self._progress_stage(0.90)
             self._activate(setup, robot_type)
         except Exception as exc:
             traceback.print_exc()
@@ -1299,6 +1319,7 @@ class App:
         self._can_lost = False
         self._log_safe("已连接 · " + arm.summary(), "ok")
         self._post(("connected", None))
+        self._progress_stage(1.0)
 
     def _watch_can(self) -> None:
         """盯着 USB 插拔：拔插过就把连接标记为失效，避免拿死句柄发帧闪退。

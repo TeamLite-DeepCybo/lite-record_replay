@@ -978,14 +978,19 @@ def scan(
     timeout: float = 0.04,
     refresh: bool = False,
     on_progress=None,
+    on_step=None,
 ) -> Setup:
     """扫描总线并给出可直接交给 Arm 的配置。
 
     forced 不为空时用它指定左右臂的通道（仍会扫描，只把没响应的电机剔除）。
     expect 是机器人类型（"gripper" / "no_gripper" / None）。
     interface 是 CAN 驱动（Linux 默认 socketcan；Windows 见 list_targets）。
+
+    on_progress(text)        文字进度（写进日志）
+    on_step(done, total)     结构化进度（界面进度条）：每扫完一条总线回调一次
     """
     say = on_progress or (lambda text: None)
+    step = on_step or (lambda done, total: None)
 
     available = list_targets(interface, refresh=refresh)
     by_label = _target_index(available)
@@ -1042,6 +1047,8 @@ def scan(
     options: dict[str, dict] = {}
     problems: list[str] = []
 
+    step(0, len(targets))
+
     # candle 硬件的探测放到子进程里做：原生库卡死时直接杀进程，界面不会被拖死
     use_worker = (
         not sys.platform.startswith("linux")
@@ -1059,7 +1066,7 @@ def scan(
             "probe", targets, ids=probe_ids, timeout=timeout, limit=worker_limit,
         )
 
-    for target in targets:
+    for index, target in enumerate(targets, start=1):
         say(f"扫描 {target.label} ...")
         if use_worker:
             entry = worker_results.get(target.label) if isinstance(worker_results, dict) else None
@@ -1081,6 +1088,7 @@ def scan(
             say(f"  {target.label} 上发现 {len(found)} 个电机：{sorted(found)}")
         else:
             say(f"  {target.label} 可以打开，但没有电机应答")
+        step(index, len(targets))
 
     if not forced:
         # 每条臂各挑命中最多的那条总线；两条臂可能落在同一条上
