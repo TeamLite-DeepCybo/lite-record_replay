@@ -14,7 +14,8 @@ Release 上有两个包，按机器架构选一个：
 解压后保持这些文件在同一目录：
 
 ```
-LiteRecordReplay.exe     单文件程序
+LiteRecordReplay.exe     程序（双击即启动，不需要解压）
+_internal\               程序依赖，必须与 exe 同目录
 calibration.json         标定文件（找不到时用内置副本自动生成）
 data\motions\            录制文件存放处（可以先删掉让它自动创建）
 README.md                使用说明
@@ -64,7 +65,7 @@ README.md                使用说明
 - `selfcheck.py`：Python 版本/位数、numpy、python-can、robstride-dynamics、tkinter、Tk、电机表、CAN 适配器
 - `start_gui.bat` 用 `pythonw` 启动（无控制台），带 `PYTHONUTF8=1`（中文路径/日志不乱码）
 - `run.bat` 带控制台启动，方便排查 CAN 问题
-- `build_exe.bat` 可本地打包单文件 exe
+- `build_exe.bat` 可本地打包免解压目录版（exe + `_internal\`）
 
 **其它**
 

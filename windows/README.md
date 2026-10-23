@@ -9,14 +9,18 @@
 到 [Releases](https://github.com/TeamLite-DeepCybo/lite-record_replay/releases) 下载
 `LiteRecordReplay-*-x64.zip`（arm64 机器下 `-arm64`），解压后双击 **`LiteRecordReplay.exe`**。
 
-解压出来应该是这样（**这几个要放在一起**）：
+解压出来应该是这样（**exe 和 `_internal` 必须放在一起**）：
 
 ```
-LiteRecordReplay.exe     单文件程序
+LiteRecordReplay.exe     程序（双击即启动，不需要解压）
+_internal\               程序依赖（约 60 MB，必须与 exe 同目录）
 calibration.json         标定文件（exe 找不到时会用内置副本自动生成）
 data\motions\           录制文件存在这里
 README.md                本文件
 ```
+
+> **免解压启动**：exe 直接运行，不会像单文件包那样每次先解压到 `%TEMP%`
+> （不会再出现 `could not create temporary directory`，启动也更快）。
 
 exe 由 GitHub Actions 在 Windows runner 上构建（x64 + arm64），构建后会做启动冒烟测试。
 
@@ -30,7 +34,7 @@ exe 由 GitHub Actions 在 Windows runner 上构建（x64 + arm64），构建后
 装好之后，平时直接双击桌面的 **Lite Record Replay** 图标即可。
 
 - 想看日志/报错：`bin\run.bat`（带控制台）
-- 想打包成单文件 exe：`bin\build_exe.bat`
+- 想打包成免解压目录版：`bin\build_exe.bat`
 
 ## 目录
 
@@ -46,7 +50,7 @@ windows/
     ├── install.bat           install_windows.ps1 的批处理壳
     ├── start_gui.bat         启动（pythonw，无控制台）
     ├── run.bat               启动（python，带控制台，排查用）
-    ├── build_exe.bat         PyInstaller 单文件打包
+    ├── build_exe.bat         PyInstaller 目录版打包（exe + _internal）
     ├── requirements-win.txt  Windows 依赖清单
     └── selfcheck.py          安装后自检（依赖 / Tk / CAN 适配器 / 程序本体）
 ```
@@ -203,7 +207,7 @@ USB 上插着的适配器比程序能认到的多，说明有设备被别的进�
 这是保护：拔插会让旧句柄失效，继续发帧会让驱动直接崩掉进程。点「重新连接」即可恢复；
 失效状态下录制/回放按钮会被拦住，不会带着坏句柄动作。
 
-**想要一个真正的 .exe（单文件、双击即用）**
+**想要二进制的 exe（免解压目录版）**
 
 在 Windows 上跑 `bin\build_exe.bat`，产物在 `dist\LiteRecordReplay.exe`。
 注意 exe 与架构相关，x64 / arm64 需要各自打一次。

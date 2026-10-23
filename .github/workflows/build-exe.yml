@@ -81,7 +81,7 @@ jobs:
           $hidden = @()
           foreach ($b in $backends) { $hidden += @("--hidden-import", "can.interfaces.$b") }
           python -m PyInstaller `
-            --noconfirm --clean --windowed --onefile `
+            --noconfirm --clean --windowed `
             --name "LiteRecordReplay" `
             --icon "$root/app/assets/logo-emblem.ico" `
             --add-data "$root/app/assets;assets" `
@@ -100,11 +100,14 @@ jobs:
 
       - name: Smoke test
         run: |
-          $exe = "dist/LiteRecordReplay.exe"
+          # 目录版（--onedir）：exe 直接启动，不解压到临时目录
+          $dir = "dist/LiteRecordReplay"
+          $exe = "$dir/LiteRecordReplay.exe"
           if (-not (Test-Path $exe)) { throw "exe not built" }
-          $size = (Get-Item $exe).Length
-          Write-Host "exe size: $([math]::Round($size / 1MB, 1)) MB"
-          if ($size -lt 5MB) { throw "exe is suspiciously small - the bundle is probably incomplete" }
+          if (-not (Test-Path "$dir/_internal")) { throw "_internal not found - onedir bundle is incomplete" }
+          $total = (Get-ChildItem $dir -Recurse -File | Measure-Object Length -Sum).Sum
+          Write-Host "bundle size: $([math]::Round($total / 1MB, 1)) MB"
+          if ($total -lt 20MB) { throw "bundle is suspiciously small - the bundle is probably incomplete" }
 
           # 硬校验：--version 必须正常退出（argparse 走 sys.exit(0)）
           $v = Start-Process -FilePath $exe -ArgumentList "--version" -PassThru -Wait
@@ -113,11 +116,11 @@ jobs:
 
           # 硬校验：--diagnose 必须写出报告，且 python-can 的厂商后端真的能用
           # （之前 exe 缺 can.interfaces.gs_usb 就是这么漏掉的）
-          Remove-Item "dist/can-diagnose.txt" -ErrorAction SilentlyContinue
+          Remove-Item "$dir/can-diagnose.txt" -ErrorAction SilentlyContinue
           $d = Start-Process -FilePath $exe -ArgumentList "--diagnose" -PassThru -Wait
           if ($d.ExitCode -ne 0) { throw "--diagnose exited with $($d.ExitCode)" }
-          if (-not (Test-Path "dist/can-diagnose.txt")) { throw "--diagnose wrote no report" }
-          $report = Get-Content "dist/can-diagnose.txt" -Raw
+          if (-not (Test-Path "$dir/can-diagnose.txt")) { throw "--diagnose wrote no report" }
+          $report = Get-Content "$dir/can-diagnose.txt" -Raw
           Write-Host $report
           foreach ($needle in @("gs_usb", "libusb", "CAN 适配器")) {
             if ($report -notmatch [regex]::Escape($needle)) { throw "report is missing '$needle'" }
@@ -141,15 +144,17 @@ jobs:
           $ver = "${{ github.event.inputs.version }}"
           if (-not $ver) { $ver = "${{ github.ref_name }}" -replace '^v', '' }
           $name = "LiteRecordReplay-$ver-${{ matrix.arch }}"
-          New-Item -ItemType Directory -Force -Path "packaging/$name" | Out-Null
-          Copy-Item "dist/LiteRecordReplay.exe" "packaging/$name/"
-          Copy-Item "app/calibration.json" "packaging/$name/" -ErrorAction SilentlyContinue
-          New-Item -ItemType Directory -Force -Path "packaging/$name/data/motions" | Out-Null
+          $dest = "packaging/$name"
+          New-Item -ItemType Directory -Force -Path $dest | Out-Null
+          # 整体搬目录版：exe + _internal/（启动不解压，秒开）
+          Copy-Item "dist/LiteRecordReplay/*" $dest -Recurse -Force
+          Copy-Item "app/calibration.json" $dest -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force -Path "$dest/data/motions" | Out-Null
           # 用 ASCII 文件名：Compress-Archive 会用系统代码页存中文名，英文 Windows 上会乱码
-          Copy-Item "windows/README.md" "packaging/$name/README.md"
+          Copy-Item "windows/README.md" "$dest/README.md"
           "name=$name" >> $env:GITHUB_OUTPUT
-          Compress-Archive -Path "packaging/$name" -DestinationPath "$name.zip" -Force
-          "把 exe 和它旁边的 data/、calibration.json 一起解压即可"
+          Compress-Archive -Path $dest -DestinationPath "$name.zip" -Force
+          "解压后双击 LiteRecordReplay.exe 即可（旁边必须有 _internal 目录）"
 
       - uses: actions/upload-artifact@v4
         with:

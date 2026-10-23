@@ -23,7 +23,8 @@ Prime Lite 半身双臂机器人的**拖动示教录制 / 动作回放**工具�
 到 [Releases](https://github.com/TeamLite-DeepCybo/lite-record_replay/releases) 下载
 `LiteRecordReplay-2.0.5-win-x64.zip`（arm64 机器下 `-arm64`），解压后**双击 `LiteRecordReplay.exe`**。
 
-单文件、带图标、无黑框，机器上不需要装 Python。
+**免解压启动**：exe 直接运行，不会像单文件包那样每次先解压到临时目录（不会再出现
+`could not create temporary directory`，启动也更快）。`_internal\` 目录必须和 exe 放在一起。
 
 ### 方式 B：从源码跑（便于改代码）
 
@@ -169,7 +170,7 @@ windows\2-启动.bat --channels "candleLight#0","candleLight#1"
 
 `.venv\` 里的 python 是标准虚拟环境，部分杀软会对新生成的 exe 报警，加白名单即可。
 
-**想要一个真正的 .exe（单文件，双击即用）**
+**想要二进制的 exe（免解压目录版）**
 
 运行 `windows\bin\build_exe.bat`，会用 PyInstaller 打出 `dist\LiteRecordReplay.exe`。
 exe 与架构相关，x64 / arm64 需要各自打一次（CI 里两个架构都会打）。

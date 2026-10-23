@@ -28,9 +28,9 @@ for %%B in (%CAN_BACKENDS%) do set "CAN_HIDDEN=!CAN_HIDDEN! --hidden-import can.
 
 echo 安装 PyInstaller ...
 ".venv\Scripts\python.exe" -m pip install -q pyinstaller
-echo 开始打包 ...
+echo 开始打包（目录版：exe 直接启动，不解压到临时目录）...
 ".venv\Scripts\python.exe" -m PyInstaller ^
-  --noconfirm --clean --windowed --onefile ^
+  --noconfirm --clean --windowed ^
   --name "LiteRecordReplay" ^
   --icon "%ROOT%\app\assets\logo-emblem.ico" ^
   --add-data "%ROOT%\app\assets;assets" ^
@@ -55,8 +55,8 @@ if errorlevel 1 (
   exit /b 1
 )
 echo.
-echo 完成：dist\LiteRecordReplay.exe
+echo 完成：dist\LiteRecordReplay\LiteRecordReplay.exe（要和旁边的 _internal\ 一起分发）
 echo 自检（会打印/写出 CAN 诊断报告）：
-echo   dist\LiteRecordReplay.exe --diagnose
-echo 注意 exe 与架构相关，x64 与 arm64 需要各自打一次。
+echo   dist\LiteRecordReplay\LiteRecordReplay.exe --diagnose
+echo 注意产物与架构相关，x64 与 arm64 需要各自打一次。
 pause
