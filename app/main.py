@@ -1318,8 +1318,10 @@ class App:
         self._usb_mark = usbwatch.snapshot()
         self._can_lost = False
         self._log_safe("已连接 · " + arm.summary(), "ok")
-        self._post(("connected", None))
+        # 注意顺序：先把进度补到 100%，再发「已连接」—— 界面收到 connected 会把
+        # 进度条清零回就绪；反过来的话最后一条进度又把条子顶回满格，看起来像还在连接。
         self._progress_stage(1.0)
+        self._post(("connected", None))
 
     def _watch_can(self) -> None:
         """盯着 USB 插拔：拔插过就把连接标记为失效，避免拿死句柄发帧闪退。
