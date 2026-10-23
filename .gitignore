@@ -1,0 +1,12 @@
+# macOS
+.DS_Store
+._*
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+*.egg-info/
+
+# 运行期生成
+*.log
