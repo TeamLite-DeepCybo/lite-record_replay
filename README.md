@@ -1,5 +1,8 @@
 # Lite 动作录制 / 回放　`v2.0.5`
 
+> **这是 Windows 版分支。** Ubuntu / Linux 版 → [https://github.com/TeamLite-DeepCybo/lite-record_replay/tree/ubuntu](https://github.com/TeamLite-DeepCybo/lite-record_replay/tree/ubuntu)　｜　版本索引 → [https://github.com/TeamLite-DeepCybo/lite-record_replay/tree/main](https://github.com/TeamLite-DeepCybo/lite-record_replay/tree/main)
+
+
 Prime Lite 半身双臂机器人的**拖动示教录制 / 动作回放**工具：一个窗口、两个脚本就能用。
 
 支持 **Linux**（`v2.0.5`）与 **Windows**（`v2.0.5-win`，x64 / arm64），同一套代码、同一个界面。
