@@ -123,6 +123,32 @@ def _prime_gs_usb(handler) -> None:
         pass
 
 
+def ensure_candle_backend() -> bool:
+    """确保 python-can 认识 `candle` 这个后端名。
+
+    `python-can-candle` 平时是靠**包的 entry point 元数据**注册进
+    `can.interfaces.BACKENDS` 的；打包成 exe 后，PyInstaller 默认不收集
+    `.dist-info`，元数据丢失 → `can.interface.Bus(interface="candle")` 直接抛
+    `CanInterfaceNotImplementedError: Unknown interface type "candle"`。
+
+    父进程里 `detect` 会手工注册一次，但**扫描是在子进程里跑的**
+    （`--can-scan-worker`），子进程没人调那段代码，于是整批扫描全报这个错。
+    所以把兜底注册放到真正打开总线的地方，覆盖 GUI / 子进程 / discover /
+    calibrate 所有路径。
+    """
+    try:
+        import can.interfaces as interfaces
+
+        if "candle" in interfaces.BACKENDS:
+            return True
+        from candle.candle_bus import CandleBus  # noqa: F401
+
+        interfaces.BACKENDS["candle"] = ("candle.candle_bus", "CandleBus")
+        return True
+    except Exception:  # noqa: BLE001  没装 python-can-candle
+        return False
+
+
 def _apply_send_timeout(handler, limit: float) -> None:
     """把 handler.send 的默认超时收紧到 limit 秒。
 
@@ -220,6 +246,8 @@ class ArmBus(RobstrideBus):
         """
         if self.is_connected:
             raise RuntimeError(f"{self.channel} 已经打开了，不要重复 connect()")
+        if str(self.interface).lower() == "candle":
+            ensure_candle_backend()
         kwargs = dict(self.open_kwargs)
         kwargs.setdefault("channel", self.channel)
         kwargs.setdefault("bitrate", self.bitrate)

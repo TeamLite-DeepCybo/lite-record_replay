@@ -71,6 +71,10 @@ jobs:
           $root = (Get-Location).Path
           # python-can 的后端是按名字动态 import 的，PyInstaller 静态分析看不到，
           # 必须显式 hidden-import，否则运行时 "Cannot import module can.interfaces.gs_usb"
+          # `candle` 是独立插件包：入口 candle.candle_bus + entry point 元数据
+          # （--copy-metadata python-can-candle）缺一不可。少了元数据，python-can
+          # 就认不出 "candle" 这个名字，扫描子进程会报
+          # CanInterfaceNotImplementedError: Unknown interface type "candle"
           $backends = @("gs_usb","pcan","canalystii","slcan","serial","kvaser","vector",
                         "systec","ixxat","usb2can","cantact","socketcan","socketcand",
                         "udp_multicast","virtual")
@@ -84,6 +88,10 @@ jobs:
             --add-data "$root/app/calibration.json;." `
             --paths "$root/app" `
             --hidden-import "usb.backend.libusb1" `
+            --hidden-import "candle.candle_bus" `
+            --collect-all candle `
+            --collect-all candle_api `
+            --copy-metadata python-can-candle `
             @hidden `
             --collect-submodules gs_usb `
             --collect-all libusb_package `

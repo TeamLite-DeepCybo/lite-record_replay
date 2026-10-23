@@ -1614,6 +1614,19 @@ def diagnose_report() -> str:
         except Exception as exc:  # noqa: BLE001
             put(f"  [--]   {module}: {exc}")
     put(f"  [..]   libusb: {libusb.describe()}")
+    # candle 是否真的注册进 python-can：exe 里丢了 python-can-candle 的 entry point
+    # 元数据时这里是"未注册"，扫描子进程会报 Unknown interface type "candle"
+    try:
+        import can.interfaces as _ifaces
+
+        _registered = "candle" in _ifaces.BACKENDS
+    except Exception:  # noqa: BLE001
+        _registered = False
+    put(
+        "  [ok]   candle 后端已注册"
+        if _registered
+        else '  [!!]   candle 后端未注册（打包缺 entry point 元数据，扫描会报 Unknown interface type "candle"）'
+    )
     put()
     put("== CAN 适配器 ==")
 
@@ -1623,7 +1636,7 @@ def diagnose_report() -> str:
     except Exception as exc:  # noqa: BLE001
         put(f"  枚举失败：{exc}")
     if not targets:
-        put("  没有检测到（Windows 看下面的提示；Linux 先跑 bash app/canup.sh）")
+        put("  没有检测到（检查 USB-CAN 是否插好、驱动是否装上）")
     for target in targets:
         put(f"  {target.label:26s} 驱动 {target.driver:12s} channel={target.channel!r}")
     for item in detect.missing_components():
