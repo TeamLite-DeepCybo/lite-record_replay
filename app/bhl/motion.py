@@ -263,9 +263,15 @@ def replay(
 
     # 姿态差比关节整个行程还大 —— 不可能是真实姿态差，
     # 典型原因是断电重上电后电机零位/标定偏移对不上（差出 2π 之类）
+    #
+    # 夹爪例外：丝杠/齿条结构开合一次要转好几圈（实测 18.7 rad ≈ 3 圈），
+    # config 里写的 114°/380° 是夹爪开口行程、不是电机圈数，用它当判据会把
+    # 每一段正常的夹爪录制都拒掉。夹爪不做这个检查，按绝对位置正常靠近。
     impossible = {}
     for name, value in gaps.items():
         spec = config.MOTORS_BY_NAME[name]
+        if spec.is_gripper:
+            continue
         if abs(value) > (spec.upper - spec.lower) * 1.05:
             impossible[name] = value
     if impossible:
