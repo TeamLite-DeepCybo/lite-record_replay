@@ -26,6 +26,20 @@ from . import config, libusb, paths
 from .bus import ArmBus, release_usb
 from .util import quiet
 
+# 排查钩子：worker 会把它设成"写一行里程碑到文件"。之所以要在调用**之前**写，
+# 是因为 candle 卡死时会一直攥着 GIL，卡住之后 Python 里任何东西都跑不了
+# （faulthandler 的看门狗也救不了），只能靠"最后一条里程碑"反推卡在哪一步。
+_MARK = None
+
+
+def _mark(text: str) -> None:
+    if _MARK is None:
+        return
+    try:
+        _MARK(text)
+    except Exception:  # noqa: BLE001  排查钩子绝不能影响正常流程
+        pass
+
 ROOT = paths.app_root()   # 打包成 exe 后是 exe 所在目录
 
 # 打开/枚举一个适配器最多等多久。Windows 上 USB-CAN 的驱动调用是阻塞式的，
@@ -63,6 +77,32 @@ def call_with_timeout(func, timeout: float = CALL_TIMEOUT_S):
     if error is not None:
         raise error
     return box.get("value")
+
+
+def _parse_worker_lines(text: str) -> tuple[dict | None, dict]:
+    """从 worker 的 stdout 里挑出 JSON 行，返回 (整批结果, 逐条结果)。
+
+    worker 每扫完一条总线就发一行 {"result": {label: {...}}}，
+    全部扫完再发一行 {"results": {...}}。中间可能混着 candle 原生层的
+    调试输出（"Found candle usb device ..."），所以不能整段 json.loads。
+    """
+    payload: dict | None = None
+    partial: dict = {}
+    for line in (text or "").splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            obj = json.loads(line)
+        except Exception:  # noqa: BLE001
+            continue
+        if not isinstance(obj, dict):
+            continue
+        if isinstance(obj.get("result"), dict):
+            partial.update(obj["result"])
+        elif isinstance(obj.get("results"), dict):
+            payload = obj
+    return payload, partial
 
 
 def run_worker(action: str, targets: list["Target"], *, ids=None, timeout=0.05,
@@ -143,32 +183,50 @@ def run_worker(action: str, targets: list["Target"], *, ids=None, timeout=0.05,
             input=json.dumps(request, ensure_ascii=False),
             timeout=limit + 8.0,
         )
-    except subprocess.TimeoutExpired:
+    except subprocess.TimeoutExpired as exc:
         try:
             kill_tree(process)
         except Exception:  # noqa: BLE001
             pass
-        return None, f"探测超过 {limit:.0f} 秒没有返回（已强杀子进程树，设备句柄已释放）"
+        raw = exc.output or ""
+        if isinstance(raw, (bytes, bytearray)):
+            raw = raw.decode("utf-8", "replace")
+        _payload, partial = _parse_worker_lines(raw)
+        if partial:
+            return partial, f"部分总线超过 {limit:.0f} 秒未返回，已采用已完成的结果"
+        return None, f"探测超过 {limit:.0f} 秒没有返回（已强杀子进程树）"
     except OSError as exc:  # noqa: BLE001
         return None, f"起不了扫描子进程：{exc}"
 
     payload: dict | None = None
+    partial: dict = {}
     if out.strip():
-        try:
-            payload = json.loads(out)
-        except Exception:  # noqa: BLE001
-            payload = None
+        # 不能整段 json.loads：candle 的原生层会往 stdout 打调试信息
+        # （比如 "Found candle usb device 1d50:606f, but access denied."），
+        # 混在 JSON 前面/后面都会让整段解析失败。逐行取，只认 JSON 行。
+        payload, partial = _parse_worker_lines(out)
 
     worker_error = ""
     if isinstance(payload, dict):
         worker_error = str(payload.get("worker_error") or "")
     if process.returncode != 0:
-        return (payload or {}).get("results"), worker_error or (
+        merged = dict(partial)
+        merged.update((payload or {}).get("results") or {})
+        if merged:
+            return merged, worker_error or f"子进程异常退出（退出码 {process.returncode}），只拿到部分结果"
+        return None, worker_error or (
             f"子进程退出码 {process.returncode}：{(err or out or '')[-300:]}"
         )
     if not isinstance(payload, dict):
-        return None, f"子进程输出无法解析：{(out or '')[-200:]}"
-    return payload.get("results"), worker_error
+        if partial:                      # 只拿到部分结果也算有收获
+            return partial, "子进程没有返回完整结果，只拿到部分总线"
+        return None, (
+            f"子进程输出无法解析：{out[:200]!r} …（共 {len(out)} 字节，"
+            f"stderr={((err or '')[:120])!r}）"
+        )
+    merged = dict(partial)
+    merged.update(payload.get("results") or {})
+    return merged, worker_error
 
 
 class DetectError(RuntimeError):
@@ -363,21 +421,10 @@ def missing_components() -> list[str]:
     except Exception:  # noqa: BLE001
         problems.append("缺少 gs_usb 包（pip install gs_usb），gs_usb 兜底需要它")
 
-    # USB 上明明插着 candleLight，candle 却打不开 → 被别的进程独占了
-    # （candleLight / CANable 是独占设备，两个程序同时开会把原生库卡死）
-    if sys.platform.startswith("win") and not _IN_CAN_WORKER:
-        try:
-            from gs_usb.gs_usb import GsUsb
-
-            plugged = len(GsUsb.scan()) if libusb.ensure() else 0
-        except Exception:  # noqa: BLE001
-            plugged = 0
-        if plugged:
-            problems.append(
-                f"USB 上插着 {plugged} 只 candleLight，但 candle 打不开 —— "
-                "多半被别的程序占着（另一个实例 / 别人的上位机 / 卡死的旧进程）。"
-                "把它们都关掉；还不行就把适配器拔插一次（卡在驱动里的进程 Windows 杀不掉）"
-            )
+    # 注意：这里**不要**再去枚举 candle 设备。枚举要点开 USB 句柄读序列号，
+    # 一旦有卡死的旧进程攥着设备，这个调用会把调用方一起阻塞住
+    # （历史 bug：诊断报告写完、进程却再也退不出去）。
+    # "被别的程序独占"的判断放在 ensure_can() 里——那里已经知道 candle 一只都没认到。
     return problems
 
 
@@ -400,6 +447,21 @@ def ensure_can(channels=None, on_progress=None, interface: str | None = None):
                 "也可用 --interface 指定驱动（pcan / canalystii / slcan / gs_usb / kvaser …）",
             ]
             messages += [f"  - {item}" for item in missing_components()]
+            # USB 上明明插着 candleLight，candle 却一只都没认到 → 被别的进程独占了。
+            # GsUsb.scan() 只做 libusb 描述符枚举，不打开设备，不会被卡死的句柄拖住。
+            if sys.platform.startswith("win"):
+                try:
+                    from gs_usb.gs_usb import GsUsb
+
+                    plugged = len(GsUsb.scan()) if libusb.ensure() else 0
+                except Exception:  # noqa: BLE001
+                    plugged = 0
+                if plugged:
+                    messages.append(
+                        f"USB 上插着 {plugged} 只 candleLight，candle 却一只都没认到 —— "
+                        "多半被别的程序占着（另一个实例 / 别人的上位机 / 卡死的旧进程）。"
+                        "把它们都关掉；还不行就把适配器拔插一次（卡在驱动里的进程 Windows 杀不掉）"
+                    )
             return False, messages
         say("检测到 CAN 适配器：" + "，".join(target.label for target in targets))
         return True, []
@@ -478,12 +540,22 @@ def _candle_targets() -> list[Target]:
             targets: list[Target] = []
             for item in raw["targets"]:
                 if isinstance(item, dict) and item.get("label"):
+                    channel = item.get("channel")
+                    serial = str(channel).split(":")[0] if channel else ""
                     targets.append(
                         Target(
                             label=str(item["label"]),
-                            channel=item.get("channel"),
+                            channel=channel,
                             driver="candle",
                             options=dict(item.get("options") or {}),
+                            # 必须带上别名：上层会用"序列号:通道"去点名要扫哪几只
+                            # （记住的左右臂适配器就是按通道存的），
+                            # 没有别名就会查不到而退回默认驱动（Windows 上是 pcan）。
+                            aliases=tuple(
+                                alias
+                                for alias in (serial, channel)
+                                if alias
+                            ),
                         )
                     )
             return targets
@@ -566,18 +638,19 @@ def _gs_usb_targets() -> list[Target]:
 
 
 _TARGETS_CACHE: dict[str, tuple[float, list[Target]]] = {}
-TARGETS_TTL_S = 5.0
+TARGETS_TTL_S = 30.0
 
 
-def list_targets(interface: str | None = None) -> list[Target]:
-    """列出可用的 CAN 总线（带 5 秒缓存）。
+def list_targets(interface: str | None = None, *, refresh: bool = False) -> list[Target]:
+    """列出可用的 CAN 总线（带 30 秒缓存）。
 
-    USB 设备枚举在 Windows 上不算便宜，而且界面启动时会连着问好几次
-    （检查 → 扫描 → 出错时再解释一遍）。缓存几秒能明显减少"正在连接…"的等待。
+    USB 设备枚举在 Windows 上不算便宜（candle 要逐个打开设备读序列号），
+    而且界面启动时会连着问好几次（检查 → 扫描 → 出错时再解释一遍）。
+    缓存能明显减少"正在连接…"的等待。refresh=True 强制重查（拔插后用）。
     """
     key = (interface or "auto").strip().lower()
     cached = _TARGETS_CACHE.get(key)
-    if cached is not None and (time.perf_counter() - cached[0]) < TARGETS_TTL_S:
+    if not refresh and cached is not None and (time.perf_counter() - cached[0]) < TARGETS_TTL_S:
         return list(cached[1])
 
     targets = _enumerate_targets(interface)
@@ -727,11 +800,16 @@ def sniff(target: Target, seconds: float = 1.5) -> tuple[dict[int, int], int]:
                 break
             note(handler.recv(timeout=min(0.2, remain)))
     finally:
-        try:
-            handler.shutdown()
-        except Exception:
-            pass
-        release_usb(handler)
+        # 子进程里**不做**优雅关闭：candle 的 shutdown()/libusb_close() 在总线
+        # 持续报错时会阻塞在原生代码里，而且阻塞期间攥着 GIL —— 连 _bounded 的
+        # 超时线程都醒不过来，整个 worker 就被冻死了（界面看到的"扫描卡 80 秒"）。
+        # worker 马上要退出，句柄由操作系统回收，不需要这一步。
+        if not _IN_CAN_WORKER:
+            try:
+                handler.shutdown()
+            except Exception:
+                pass
+            release_usb(handler)
 
     return counts, errors
 
@@ -790,7 +868,9 @@ def _probe(target: Target, ids: list[int], timeout: float) -> tuple[set[int], st
                 open_kwargs=target.connect_kwargs,
             )
             # 探测阶段在子进程里跑，单条总线开不起来就别等太久（3 秒够了）
+            _mark(f"open {target.label}")
             call_with_timeout(lambda: bus.connect(handshake=False), timeout=3.0)
+            _mark(f"opened {target.label}")
     except _CallTimeout:
         return set(), "打开超时（这个适配器可能被别的程序占用了）"
     except Exception as exc:  # noqa: BLE001 - 该 CAN 口不存在 / 打不开
@@ -798,17 +878,32 @@ def _probe(target: Target, ids: list[int], timeout: float) -> tuple[set[int], st
 
     found: set[int] = set()
     misses = 0
+    stalls = 0
     error = ""
     try:
+        _mark(f"ping {target.label}")
         for device_id in ids:
             hit = False
             for _attempt in range(2):      # USB-CAN 偶尔丢一帧，重试一次再判"没有"
                 try:
                     with quiet():
+                        started = time.perf_counter()
                         response = bus.ping_by_id(device_id, timeout=timeout)
+                        spent = time.perf_counter() - started
                 except Exception as exc:   # 发不出去就不用再试别的 ID 了
                     error = f"{type(exc).__name__}: {exc}"
                     break
+                # 总线上没人 ACK 时，candle 固件会把这一帧重发到 USB 超时才返回（约 1 秒），
+                # 而有节点 ACK 时发一帧只要几十微秒。连续两次卡住且一无所获 = 这条线是死的，
+                # 不必再把剩下的 ID 挨个试一遍（16 个 ID × 1 秒会让扫描拖到一分半）。
+                # 总线上没人 ACK 时，candle 发一帧要等满 CAN_SEND_TIMEOUT 才返回
+                # （默认 1 秒，已收到 0.2 秒），而有节点 ACK 时只要几十微秒。
+                # 连续两次卡住且一无所获 = 这条线是死的，不必再把剩下的 ID 挨个试。
+                if spent > 0.15:
+                    stalls += 1
+                    if not found and stalls >= 2:
+                        error = "发帧超时（总线上没有节点应答：没上电 / 线没接 / 缺终端电阻）"
+                        break
                 # 空闲/回环的 CAN 口会对任何 ping 用 device_id=0 回应，
                 # 所以必须校验回帧里的 ID 和所 ping 的一致，否则一律不算命中。
                 if response is not None and response[0] == device_id:
@@ -821,16 +916,57 @@ def _probe(target: Target, ids: list[int], timeout: float) -> tuple[set[int], st
                 misses = 0
             else:
                 misses += 1
-                if misses >= 6:            # 连续 6 个都没反应，这条总线基本可以放弃
+                # 注意：只有"这条总线已经有收获"时才允许提前放弃。
+                # 右臂电机 ID 是 21-28，而探测顺序是 11-18 再 21-28：
+                # 在右臂那条总线上，前 6 个（11-16）必然全都不响，
+                # 若无条件 break，永远走不到 21-28，右臂会被判成"没有电机应答"。
+                if found and misses >= 6:
                     break
     finally:
-        try:
-            with quiet():
-                bus.disconnect(disable_torque=False)
-        except Exception:
-            pass
+        # worker 里分两步区别对待：
+        #   · shutdown() 只做通道 reset，把固件放回干净状态 —— 必须做，
+        #     否则上一轮留下的半开状态会累积，几次之后连 open 都会卡住；
+        #   · release_usb()（libusb_close）在报错总线上会永久阻塞且攥着 GIL，
+        #     谁等谁死，所以跳过；进程马上 _exit，句柄由系统回收。
+        handler = getattr(bus, "channel_handler", None)
+        if handler is not None and _IN_CAN_WORKER:
+            try:
+                handler.shutdown()
+            except Exception:
+                pass
+        elif not _IN_CAN_WORKER:
+            try:
+                with quiet():
+                    bus.disconnect(disable_torque=False)
+            except Exception:
+                pass
 
     return found, error
+
+
+_LAST_GOOD_FILE = ".last-good-buses.json"
+
+
+def _load_good_channels() -> list[str]:
+    """上次扫描时真正有电机的总线通道（"序列号:0"）。
+
+    用通道而不是标签：标签里的 candleLight#N 是枚举序号，插拔后会变，
+    通道（序列号）才是稳定的。
+    """
+    try:
+        raw = json.loads((paths.app_root() / _LAST_GOOD_FILE).read_text(encoding="utf-8-sig"))
+        return [str(item) for item in (raw.get("channels") or [])]
+    except Exception:  # noqa: BLE001
+        return []
+
+
+def _save_good_channels(channels) -> None:
+    try:
+        (paths.app_root() / _LAST_GOOD_FILE).write_text(
+            json.dumps({"channels": list(channels)}, ensure_ascii=False), encoding="utf-8"
+        )
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def scan(
@@ -840,6 +976,7 @@ def scan(
     expect: str | None = None,
     interface: str | None = None,
     timeout: float = 0.04,
+    refresh: bool = False,
     on_progress=None,
 ) -> Setup:
     """扫描总线并给出可直接交给 Arm 的配置。
@@ -850,7 +987,7 @@ def scan(
     """
     say = on_progress or (lambda text: None)
 
-    available = list_targets(interface)
+    available = list_targets(interface, refresh=refresh)
     by_label = _target_index(available)
 
     if forced:
@@ -863,14 +1000,30 @@ def scan(
             )
     else:
         if candidates:
-            targets = [
-                by_label.get(name)
-                or Target(label=name, channel=name, driver=config.default_can_interface())
-                for name in candidates
-            ]
+            # candidates 既可以是标签（candleLight#0 (序列号)），也可以是通道
+            # （"序列号:0"）—— "记住左右臂插在哪两只" 就是按通道存的。
+            by_channel = {str(item.channel): item for item in available}
+            targets = []
+            for name in candidates:
+                found_target = by_label.get(name) or by_channel.get(str(name))
+                if found_target is None:
+                    found_target = Target(
+                        label=str(name),
+                        channel=name,
+                        driver=config.default_can_interface(),
+                    )
+                targets.append(found_target)
         else:
             targets = available
         mapping = {}
+
+    # 上次扫到电机的总线排前面：某条坏线把 candle 卡死时，手臂那两条
+    # 已经先出结果了（worker 是逐条回传的），不会一起陪葬。
+    good = _load_good_channels()
+    if good and len(targets) > 1:
+        targets = sorted(
+            targets, key=lambda item: 0 if str(item.channel) in good else 1
+        )
 
     if not targets:
         raise DetectError(
@@ -898,8 +1051,10 @@ def scan(
     worker_error = ""
     if use_worker:
         say("candle 硬件在子进程里探测（卡住会自动杀掉重来，不会拖死界面）…")
-        # 每条总线最坏情况：打开 3s + ping 16 个 ID + 关闭 6s ≈ 12s
-        worker_limit = max(30.0, 14.0 * len(targets) + 10.0)
+        # 每条总线最坏情况：打开 + ping 16 个 ID + 关闭。卡在原生调用上时，
+        # 父进程只能等超时；worker 内部还有 faulthandler 看门狗会在 limit-5 秒
+        # 自己硬退出并留下栈，所以这里不用给太长。
+        worker_limit = max(20.0, 5.0 * len(targets) + 6.0)
         worker_results, worker_error = run_worker(
             "probe", targets, ids=probe_ids, timeout=timeout, limit=worker_limit,
         )
@@ -963,6 +1118,9 @@ def scan(
         raise DetectError("找到了总线，但没有任何电机响应。请确认机器人已上电。")
 
     channels_clean = {label: config.sort_names(names) for label, names in groups.items()}
+    _save_good_channels(
+        [str(options[label].get("channel")) for label in channels_clean if options.get(label)]
+    )  # 下次优先扫这几条
     return Setup(
         channels=channels_clean,
         mapping=mapping,

@@ -13,6 +13,7 @@
 
 from __future__ import annotations
 
+import math
 import threading
 import time
 from dataclasses import dataclass, field
@@ -250,6 +251,29 @@ def replay(
     velocities = derive_velocity(positions, config.REPLAY_HZ)
 
     # 2) 软启动：从当前姿态平滑走到第一帧
+    #
+    # 先处理"绕圈"：RobStride 的位置在 ±π 附近会翻界，同一个物理角度
+    # 可能差出整圈（实测 right_shoulder_yaw 差 +6.09 rad ≈ 2π）。
+    # 如果减去整圈后落回关节行程内，就认为是绕圈而不是真的差了一整圈，
+    # 把这段录制整体平移过去（否则会把它当成"零位错了"直接拒绝回放）。
+    wrapped: dict[int, float] = {}
+    for index, name in enumerate(arm.joint_names):
+        spec = config.MOTORS_BY_NAME[name]
+        span = spec.upper - spec.lower
+        raw = float(positions[0, index] - arm.pos[index])
+        turns = round(raw / (2.0 * math.pi))
+        if turns:
+            adjusted = raw - turns * 2.0 * math.pi
+            if abs(adjusted) <= span:
+                wrapped[index] = -turns * 2.0 * math.pi
+                notes.append(
+                    f"{name} 读数绕了 {turns:+d} 圈（{raw:+.2f} → {adjusted:+.2f} rad），已按同角度处理"
+                )
+    if wrapped:
+        positions = positions.copy()
+        for index, offset in wrapped.items():
+            positions[:, index] = positions[:, index] + offset
+
     gaps = {
         name: float(positions[0, index] - arm.pos[index])
         for index, name in enumerate(arm.joint_names)
@@ -301,6 +325,8 @@ def replay(
     completed = 0
     peak_torque = 0.0
     play_seconds = 0.0  # 只统计真正播放的时间，不含两次之间的过渡
+    send_fails = 0      # 当前已连续多少帧没发出去
+    skipped = 0         # 累计跳过的帧数（瞬时发帧失败）
     started = time.perf_counter()
 
     for loop_index in range(repeat):
@@ -318,9 +344,24 @@ def replay(
             if stop.is_set():
                 finished = False
                 break
-            _pos, _vel, tau = arm.step(
-                positions[frame_index], kp=kp, kd=kd, velocities=velocities[frame_index]
-            )
+            try:
+                _pos, _vel, tau = arm.step(
+                    positions[frame_index], kp=kp, kd=kd, velocities=velocities[frame_index]
+                )
+                send_fails = 0
+            except Exception as exc:  # noqa: BLE001
+                # USB-CAN 偶发一次超时（"The message could not be sent"）很常见：
+                # 这一帧没发出去，机械臂只是少更新 20 ms 的目标位置，
+                # 因为丢一次就中止整段回放代价太大，所以连续失败够多才真停。
+                send_fails += 1
+                skipped += 1
+                if send_fails >= config.MAX_CONSECUTIVE_SEND_FAIL:
+                    raise RuntimeError(
+                        f"连续 {send_fails} 帧发送失败（{exc}）——"
+                        "USB-CAN 可能已掉线，请点「重新连接」"
+                    ) from exc
+                rate.sleep()
+                continue
             if tau.size:
                 peak_torque = max(peak_torque, float(np.abs(tau).max()))
             played += 1
@@ -350,6 +391,9 @@ def replay(
         notes.append(
             f"回放偏慢（实际 {play_seconds:.1f}s vs 预期 {expected:.1f}s），CAN 或主机可能负载偏高"
         )
+
+    if skipped:
+        notes.append(f"有 {skipped} 帧因 CAN 瞬时超时被跳过（不影响动作连续性）")
 
     return {
         "completed": completed,

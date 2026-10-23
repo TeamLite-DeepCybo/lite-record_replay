@@ -11,3 +11,9 @@ build/
 *.swp
 # 排障产物（--diagnose 生成）
 can-diagnose.txt
+
+# 运行期状态/排障产物（每台机器自己生成，不入库）
+window.json
+.robot-buses.json
+.last-good-buses.json
+worker-*.txt

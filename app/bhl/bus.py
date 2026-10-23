@@ -28,6 +28,8 @@ from robstride_dynamics.table import (
     MODEL_MIT_VELOCITY_TABLE,
 )
 
+from . import config
+
 Status = tuple[float, float, float, float]  # (位置 rad, 速度 rad/s, 力矩 Nm, 温度 ℃)
 
 
@@ -121,6 +123,28 @@ def _prime_gs_usb(handler) -> None:
         pass
 
 
+def _apply_send_timeout(handler, limit: float) -> None:
+    """把 handler.send 的默认超时收紧到 limit 秒。
+
+    candle 后端的 `CandleBus.send(msg, timeout=None)` 默认超时是 **1.0 秒**：
+    总线上没有节点 ACK 时，每发一帧都要白等满 1 秒才抛
+    `CanOperationError: The message could not be sent`。扫一条没接设备的
+    死线要十几秒、回放遇到抖动也会卡满一秒，都是这个默认值造成的。
+    正常电机的 ACK 在微秒级，所以收紧到 config.CAN_SEND_TIMEOUT 完全够用。
+    """
+    original = handler.send
+
+    def send(message, timeout=None, *args, **kwargs):
+        if timeout is None:
+            timeout = limit
+        return original(message, timeout, *args, **kwargs)
+
+    try:
+        handler.send = send          # 绑定实例属性，覆盖类方法
+    except Exception:                # noqa: BLE001  某些后端实例不允许赋值，保持原样
+        pass
+
+
 def release_usb(handler) -> None:
     """把适配器的底层句柄还给系统。
 
@@ -205,6 +229,7 @@ class ArmBus(RobstrideBus):
         )
         if str(self.interface).lower() == "gs_usb":
             _prime_gs_usb(handler)
+        _apply_send_timeout(handler, config.CAN_SEND_TIMEOUT)
         self.channel_handler = handler
 
     def disconnect(self, disable_torque: bool = True) -> None:

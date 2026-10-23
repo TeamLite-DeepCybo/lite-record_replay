@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import queue
 import subprocess
@@ -30,7 +31,7 @@ from datetime import datetime
 from pathlib import Path
 from tkinter import messagebox, ttk
 
-from bhl import config, detect, libusb, paths, motion as motion_mod, storage
+from bhl import config, detect, libusb, paths, motion as motion_mod, storage, usbwatch
 from bhl.arm import Arm
 from bhl.bus import release_usb
 
@@ -57,17 +58,105 @@ def _enable_dpi_awareness() -> None:
             pass
 
 
-def _normalize_font_scale(root: tk.Tk) -> None:
-    """把 Tk 的"点→像素"换算固定成 96dpi，让 Windows 界面和 Linux 版逐像素一致。
+def _system_dpi() -> int:
+    """系统 DPI（96 = 100%，144 = 150%，192 = 200%）。查不到就按 96 算。"""
+    if not sys.platform.startswith("win"):
+        return 96
+    try:
+        import ctypes
 
-    DPI 感知打开后，Windows 的 125%/150% 系统缩放会让 Tk 按 120/144dpi 放大字号，
-    整个界面比 Ubuntu 版胖一圈；固定回 96dpi 后两边的字号、间距完全一样。
+        dpi = int(ctypes.windll.user32.GetDpiForSystem())
+        return dpi if dpi > 0 else 96
+    except Exception:  # noqa: BLE001
+        return 96
+
+
+def _ui_scale() -> float:
+    """界面缩放倍数。
+
+    默认跟随系统 DPI（200% 屏 -> 2.0），这样字号和记事本、资源管理器一致。
+    想临时改大改小可以设环境变量 LRR_FONT_SCALE=1.25，不用重新打包。
+    """
+    override = (os.environ.get("LRR_FONT_SCALE") or "").strip()
+    if override:
+        try:
+            return max(1.0, min(3.0, float(override)))
+        except ValueError:
+            pass
+    return max(1.0, min(2.5, _system_dpi() / 96.0))
+
+
+def _normalize_font_scale(root: tk.Tk) -> None:
+    """让 Tk 的"点→像素"换算跟随系统 DPI。
+
+    早先这里被固定成 96dpi（为了和 Ubuntu 版逐像素一致），结果在 150%/200%
+    的高分屏上，字号是按物理像素画的 —— 比系统里其它程序小半圈，看着就是
+    "字体太小"。改成用真实 DPI 后，9pt 字在 200% 屏上从 12px 变回 24px，
+    和记事本、资源管理器一致。
     """
     if not sys.platform.startswith("win"):
         return
     try:
-        root.tk.call("tk", "scaling", 96.0 / 72.0)
+        root.tk.call("tk", "scaling", 96.0 * _ui_scale() / 72.0)
     except tk.TclError:
+        pass
+
+
+WINDOW_SIZE_FILE = "window.json"
+
+
+def _load_window_size() -> tuple[int, int] | None:
+    """上次关窗口时的大小（Tk 客户区像素）。没有这个文件或读坏了就返回 None。
+
+    用 utf-8-sig 读：这个文件有可能被记事本/PowerShell 写过，带 BOM，
+    普通 utf-8 解析会因为开头多一个 \ufeff 直接报错，然后静默退回默认尺寸。
+    """
+    try:
+        raw = json.loads((paths.app_root() / WINDOW_SIZE_FILE).read_text(encoding="utf-8-sig"))
+        width, height = int(raw["width"]), int(raw["height"])
+    except Exception:  # noqa: BLE001
+        return None
+    if 400 <= width <= 12000 and 300 <= height <= 12000:
+        return width, height
+    return None
+
+
+def _save_window_size(width: int, height: int) -> None:
+    """把窗口大小记在程序目录，下次按这个尺寸开。"""
+    try:
+        (paths.app_root() / WINDOW_SIZE_FILE).write_text(
+            json.dumps({"width": int(width), "height": int(height)}), encoding="utf-8"
+        )
+    except Exception:  # noqa: BLE001  目录只读之类的情况忽略即可
+        pass
+
+
+PIN_FILE = ".robot-buses.json"
+
+
+def _load_pinned() -> list[str]:
+    """上次确认过的"左右臂到底插在哪两只适配器"（按序列号通道记）。
+
+    USB-CAN 这层在 Windows 上有个坑：某些适配器（尤其接在没上电的线上、
+    一直报错误帧的那种）会让 candle 的原生 open/ping 卡死，而且卡住后
+    Windows 杀不掉、句柄不释放，只能拔插。所以一旦认出左右臂在哪两只上，
+    之后就一直只碰这两只，别的口一律不枚举、不打开 —— 从源头上避开这个坑。
+    """
+    try:
+        raw = json.loads((paths.app_root() / PIN_FILE).read_text(encoding="utf-8-sig"))
+        channels = [str(item) for item in (raw.get("channels") or []) if item]
+    except Exception:  # noqa: BLE001
+        return []
+    return channels if channels else []
+
+
+def _save_pinned(channels) -> None:
+    try:
+        (paths.app_root() / PIN_FILE).write_text(
+            json.dumps({"channels": list(dict.fromkeys(channels))}, ensure_ascii=False),
+            encoding="utf-8",
+        )
+    except Exception:  # noqa: BLE001
         pass
 
 
@@ -399,11 +488,15 @@ class App:
         self._offered_import = False
         self._frame_hint = 0
         self._progress_mode = "determinate"
+        self._usb_mark = None          # 连接时的 USB 设备快照
+        self._can_lost = False         # 拔插过 -> 旧句柄已失效
 
         self._build()
+        self._fit_initial_window()
         self._apply_mode("connecting")
         self._refresh_motions()
         self.root.after(80, self._drain)
+        self.root.after(900, self._watch_can)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
         # Esc 随时停机，F5 刷新动作列表
@@ -424,27 +517,23 @@ class App:
         screen_width = self.root.winfo_screenwidth()
         screen_height = self.root.winfo_screenheight()
 
-        # 窗口钳制用的"可用像素"。字号换算固定在 96dpi 后（_normalize_font_scale），
-        # 1 个 Tk 像素 = 系统缩放倍数 个物理像素；winfo 报的屏幕是 Tk 像素，
-        # 但窗口的物理宽度 = Tk像素 × 缩放倍数，直接拿 winfo 去钳会顶出屏幕。
-        # 所以 Windows 上改用 物理分辨率 / 缩放倍数 来算，保证窗口永远落在屏幕里，
-        # 并且整块界面（字、间距、控件）同比例缩放，和 Ubuntu 版一致。
+        # 窗口尺寸按显示缩放放大（字号跟着 DPI 变大了，窗口不跟着长会被内容撑爆），
+        # 但初始窗口不要铺满屏幕 —— 只占屏幕的 72%。
+        zoom = _ui_scale()
         fit_width, fit_height = screen_width, screen_height
         if sys.platform.startswith("win"):
             try:
                 import ctypes
 
-                dpi = max(96, int(ctypes.windll.user32.GetDpiForSystem()))
-                zoom = dpi / 96.0
-                fit_width = max(640, int(ctypes.windll.user32.GetSystemMetrics(0) / zoom) - 80)
-                fit_height = max(480, int(ctypes.windll.user32.GetSystemMetrics(1) / zoom) - 100)
+                fit_width = max(640, int(ctypes.windll.user32.GetSystemMetrics(0) * 0.72))
+                fit_height = max(480, int(ctypes.windll.user32.GetSystemMetrics(1) * 0.72))
             except Exception:  # noqa: BLE001 - 拿不到就用 winfo 的值兜底
                 pass
 
-        width = max(640, min(WINDOW_SIZE[0], fit_width))
-        height = max(480, min(WINDOW_SIZE[1], fit_height))
+        width = max(640, min(int(WINDOW_SIZE[0] * zoom), fit_width))
+        height = max(480, min(int(WINDOW_SIZE[1] * zoom), fit_height))
         # 矮屏（机器人自带屏等）去掉小节标题，把高度让给日志
-        self._compact = height < 800
+        self._compact = height < 800 * zoom
 
         self.root.geometry(f"{width}x{height}")
         self.root.configure(bg=C["bg"])
@@ -460,7 +549,11 @@ class App:
         else:
             self._icon = _make_icon(self.root)
 
-        outer = ttk.Frame(self.root, padding=(PAD, 12, PAD, 12))
+        outer = ttk.Frame(
+            self.root,
+            padding=(int(PAD * _ui_scale()), int(12 * _ui_scale()),
+                     int(PAD * _ui_scale()), int(12 * _ui_scale())),
+        )
         outer.pack(fill="both", expand=True)
 
         # ---- 标题栏（logo 放右上角） ------------------------------------
@@ -665,6 +758,41 @@ class App:
             return None
         return "break"  # 其余按键一律不进日志
 
+    def _fit_initial_window(self) -> None:
+        """按界面**实际需要**的尺寸收一下窗口，别一上来就铺满屏幕。
+
+        字号已经跟随系统 DPI 放大，内容尺寸由 Tk 自己算最准；这里把窗口
+        设成"内容自然尺寸"（再留一点余量），最多不超过屏幕的 86%。
+        """
+        try:
+            self.root.update_idletasks()
+            need_w = self.root.winfo_reqwidth()
+            need_h = self.root.winfo_reqheight()
+        except tk.TclError:
+            return
+
+        cap_w, cap_h = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
+        if sys.platform.startswith("win"):
+            try:
+                import ctypes
+
+                cap_w = int(ctypes.windll.user32.GetSystemMetrics(0) * 0.86)
+                cap_h = int(ctypes.windll.user32.GetSystemMetrics(1) * 0.86)
+            except Exception:  # noqa: BLE001
+                pass
+
+        width = max(720, min(need_w + 24, cap_w))
+        height = max(560, min(need_h + 24, cap_h))
+
+        # 上次关窗口时的大小优先（用户拖过就一直保持），
+        # 但不能小于界面本身需要的高度，否则一开就是挤扁/裁切的
+        saved = _load_window_size()
+        if saved is not None:
+            width = max(need_w, min(saved[0], cap_w))
+            height = max(need_h, min(saved[1], cap_h))
+
+        self.root.geometry(f"{width}x{height}")
+
     def _section(self, parent: tk.Misc, text: str) -> None:
         """小节标题 + 一条细分隔线；矮屏上只保留分隔线以节省高度。"""
         row = ttk.Frame(parent)
@@ -835,15 +963,54 @@ class App:
                 self._log_safe("已断开", "ok")
 
             self._log_safe(f"扫描电机（机型：{label}）…")
-            setup = detect.scan(
-                forced=forced, expect=robot_type, interface=self.interface, on_progress=self._log_safe
-            )
+
+            # 只探"记住的那两只"（不碰其它口）；只有在它俩找不到电机时，
+            # 才退回全量扫描去重新发现（换了适配器/换 USB 口的场景）。
+            pinned = [] if self._can_lost else _load_pinned()
+            candidates = None
+            if pinned:
+                present = {str(t.channel) for t in detect.list_targets(self.interface)}
+                if all(channel in present for channel in pinned):
+                    candidates = pinned
+
+            try:
+                setup = detect.scan(
+                    candidates=candidates,
+                    forced=forced,
+                    expect=robot_type,
+                    interface=self.interface,
+                    # 只有拔插过才强制重新枚举；否则复用 30 秒缓存，
+                    # Windows 上枚举要逐个打开设备读序列号，很贵。
+                    refresh=self._can_lost,
+                    on_progress=self._log_safe,
+                )
+            except detect.DetectError:
+                if candidates is None:
+                    raise
+                self._log_safe("记住的适配器上没有电机，改为全量扫描一次 …", "warn")
+                setup = detect.scan(
+                    forced=forced,
+                    expect=robot_type,
+                    interface=self.interface,
+                    refresh=True,
+                    on_progress=self._log_safe,
+                )
             self._log_safe(setup.describe(), "warn" if setup.missing else "ok")
 
-            # 把所有**没有电机**的 CAN 口挨个报一遍状态：
-            # 让"哪个口开着、哪个口没插线、哪个口插了但对面没上电"一目了然。
+            # 手动扫描是"全量重认"，认到哪两只就把它记成以后默认只碰的那两只
+            used_channels = [
+                str(kwargs.get("channel"))
+                for kwargs in (setup.open_options or {}).values()
+                if kwargs.get("channel")
+            ]
+            if used_channels:
+                _save_pinned(used_channels)
+
+            # 只有"没记住适配器"或"这次缺电机"时才去挨个试探其它口 ——
+            # 这段会打开每一只适配器，而那些接在没上电线路上的适配器正是
+            # 让 candle 原生层卡死的元凶。正常使用时不碰它们。
             try:
-                empty = [
+                empty = [] if pinned and not setup.missing else [
                     t for t in detect.list_targets(self.interface)
                     if t.label not in setup.channels
                 ]
@@ -869,8 +1036,10 @@ class App:
                 pass
 
             if was_connected:
-                self._log_safe("扫描完成。点「重新连接」即可恢复连接。", "info")
+                self._log_safe("扫描完成，正在按结果重新连接 …", "info")
             self._post(("scan", (setup, robot_type)))
+            # 扫完直接接上，不用再点「重新连接」
+            self._activate(setup, robot_type)
         except Exception as exc:
             traceback.print_exc()
             self._post(("error", ("扫描失败", str(exc))))
@@ -977,6 +1146,34 @@ class App:
                 return
             self._log_safe("CAN 口就绪", "ok")
 
+            # 物理插着几只 vs candle 能认出几只：少掉的那几只被别的进程占着
+            # （最常见的是上一次卡死的 scan worker）。实测这种状态下再扫，
+            # candle 的 open() 会卡在原生层，最后整批超时 + 又留一个新僵尸，
+            # 所以这里直接拦住，让用户先拔插一次。
+            physical = usbwatch.snapshot()
+            known = detect.list_targets(self.interface)
+            if physical and len(known) < len(physical):
+                lost = len(physical) - len(known)
+                self._log_safe(
+                    f"⚠ USB 上插着 {len(physical)} 只 candleLight，只能认出 {len(known)} 只"
+                    f"（{lost} 只被占用）——已停止扫描",
+                    "warn",
+                )
+                self._post(
+                    (
+                        "error",
+                        (
+                            "CAN 适配器被占用",
+                            f"USB 上插着 {len(physical)} 只 candleLight，程序只能认出 {len(known)} 只。\n\n"
+                            "被占用的那几只多半是上一次扫描卡死后留下的进程仍攥着 USB 句柄。"
+                            "这种状态下继续扫描会卡住并再留一个僵尸。\n\n"
+                            "请把 USB-CAN 拔下来再插回去，然后点「重新连接」。",
+                        ),
+                    )
+                )
+                self._post(("mode", "idle"))
+                return
+
             self._log_safe(f"扫描电机（机型：{config.ROBOT_TYPE_LABELS.get(robot_type, robot_type)}）…")
 
             def explain(exc: Exception) -> Exception:
@@ -1011,12 +1208,36 @@ class App:
                 )
 
             try:
+                # 已经记住左右臂在哪两只适配器上时，只探这两只：
+                # 多碰一只就多一次踩 candle 原生卡死的机会（见 _load_pinned 注释）。
+                pinned = _load_pinned()
+                candidates = None
+                if pinned:
+                    present = {str(item.channel) for item in detect.list_targets(self.interface)}
+                    if all(channel in present for channel in pinned):
+                        candidates = pinned
+                        self._log_safe(
+                            "已记住左右臂的适配器，本次只探测这两条（不碰其它 CAN 口）",
+                            "dim",
+                        )
+                    else:
+                        self._log_safe("记住的适配器不全在了，改为全量扫描一次", "warn")
+
                 setup = detect.scan(
+                    candidates=candidates,
                     forced=forced_channels,
                     expect=robot_type,
                     interface=self.interface,
                     on_progress=self._log_safe,
                 )
+                # 记住这次真正认到电机的通道，下次就只碰它们
+                used = [
+                    str(kwargs.get("channel"))
+                    for kwargs in (setup.open_options or {}).values()
+                    if kwargs.get("channel")
+                ]
+                if used:
+                    _save_pinned(used)
             except detect.DetectError as first:
                 if not sys.platform.startswith("linux"):
                     # Windows 没有 canup.sh 这一套，重扫一遍没意义
@@ -1038,41 +1259,81 @@ class App:
                 except detect.DetectError as exc:
                     raise explain(exc) from exc
 
-            self._log_safe(setup.describe(), "warn" if setup.missing else "info")
-            if setup.missing:
-                self._log_safe(
-                    f"⚠ 按「{config.ROBOT_TYPE_LABELS.get(robot_type, robot_type)}」应该有但没响应："
-                    f"{', '.join(setup.missing)}",
-                    "warn",
-                )
-
-            calibration, source, missing = storage.load_calibration(online_names=setup.motor_names)
-            self._log_safe(f"标定文件：{source}")
-            if missing:
-                self._log_safe(
-                    f"这些关节没有标定偏移，按 0 处理：{', '.join(missing)}", "warn"
-                )
-
-            arm = Arm(
-                setup.channels,
-                calibration,
-                interface=setup.interface,
-                options=setup.open_options,
-            )
-            self.arm = arm
-            self.last_setup = setup
-            self._log_safe("已连接 · " + arm.summary(), "ok")
-            self._post(("connected", None))
+            self._activate(setup, robot_type)
         except Exception as exc:
             traceback.print_exc()
             self._log_safe("连接失败", "error")
             self._post(("error", ("连接失败", str(exc))))
             self._post(("mode", "idle"))
 
+    def _activate(self, setup, robot_type: str = "auto") -> None:
+        """拿着扫描结果真正建立连接（读标定 → 建 Arm → 通知界面）。
+
+        `_connect`（启动/重新连接）和 `_worker_scan`（手动扫描）都走这里，
+        所以"扫描电机"之后会自动接上，不需要再点一次「重新连接」。
+        """
+        self._log_safe(setup.describe(), "warn" if setup.missing else "info")
+        if setup.missing:
+            self._log_safe(
+                f"⚠ 按「{config.ROBOT_TYPE_LABELS.get(robot_type, robot_type)}」应该有但没响应："
+                f"{', '.join(setup.missing)}",
+                "warn",
+            )
+
+        calibration, source, missing = storage.load_calibration(online_names=setup.motor_names)
+        self._log_safe(f"标定文件：{source}")
+        if missing:
+            self._log_safe(
+                f"这些关节没有标定偏移，按 0 处理：{', '.join(missing)}", "warn"
+            )
+
+        arm = Arm(
+            setup.channels,
+            calibration,
+            interface=setup.interface,
+            options=setup.open_options,
+        )
+        self.arm = arm
+        self.last_setup = setup
+        self._usb_mark = usbwatch.snapshot()
+        self._can_lost = False
+        self._log_safe("已连接 · " + arm.summary(), "ok")
+        self._post(("connected", None))
+
+    def _watch_can(self) -> None:
+        """盯着 USB 插拔：拔插过就把连接标记为失效，避免拿死句柄发帧闪退。
+
+        candleLight 被拔掉后，旧句柄在 C 层已经无效；再调用 send/recv 会让
+        candle_api fail-fast，进程直接消失。这里只做 libusb 枚举（不开设备），
+        发现设备集合变了就提前拦住录制/回放。
+        """
+        try:
+            if self.arm is not None and not self._can_lost and self._usb_mark:
+                now = usbwatch.snapshot()
+                if now is not None and now != self._usb_mark:
+                    self._can_lost = True
+                    self._log_safe(
+                        "检测到 USB-CAN 被拔插，当前连接已失效 —— 请点「重新连接」后再操作",
+                        "warn",
+                    )
+                    self._post(("status", "CAN 已断开（拔插过）"))
+        finally:
+            self.root.after(900, self._watch_can)
+
     def _reconnect(self) -> None:
         if self.arm is not None:
-            self._log_safe("断开当前连接 …")
-            self.arm.close()
+            # 只有"原来那几只都不见了"才敢跳过 close：
+            # 若只是多插了一只（原设备仍在），旧句柄还是活的，
+            # 不关掉会让重连报 Access denied。
+            still_there = True
+            if self._can_lost and self._usb_mark:
+                now = usbwatch.snapshot()
+                still_there = now is not None and self._usb_mark <= now
+            if still_there:
+                self._log_safe("断开当前连接 …")
+                self.arm.close()
+            else:
+                self._log_safe("旧连接已失效，跳过关闭直接重连 …", "warn")
             self.arm = None
         self._apply_mode("connecting")
         robot_type = self.robot_type.get()
@@ -1084,6 +1345,9 @@ class App:
     # ==================================================================
     def _record(self) -> None:
         if self.arm is None:
+            return
+        if self._can_lost:
+            self._log_safe("CAN 连接已失效（USB 被拔插过），请先点「重新连接」", "warn")
             return
         label = self.entry_label.get().strip()
         self._apply_mode("recording")
@@ -1144,6 +1408,9 @@ class App:
 
     def _replay(self) -> None:
         if self.arm is None:
+            return
+        if self._can_lost:
+            self._log_safe("CAN 连接已失效（USB 被拔插过），请先点「重新连接」", "warn")
             return
         path = self._selected_motion()
         if path is None:
@@ -1303,6 +1570,11 @@ class App:
         if self.mode in ("recording", "replaying"):
             if not messagebox.askokcancel("退出", "动作还在执行，退出前会先松手。确定退出吗？"):
                 return
+        # 记住窗口大小，下次打开就是你关掉时的大小
+        try:
+            _save_window_size(self.root.winfo_width(), self.root.winfo_height())
+        except Exception:  # noqa: BLE001
+            pass
         self.root.config(cursor="watch")
         self.root.update_idletasks()
 

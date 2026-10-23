@@ -100,6 +100,14 @@ DAMPING_KD = 0.5  # 结束时阻尼落用的 kd
 
 RECORD_TORQUE_LIMIT = 1.0  # 拖动示教时的力矩上限（越小越软）
 MAX_CONSECUTIVE_MISS = 20  # 连续多少个周期没回帧就判定掉线并停机（50Hz 下约 0.4 秒）
+# 连续多少帧"发不出去"才判定真掉线。USB-CAN 偶发一次 1 秒超时很常见
+# （`The message could not be sent`），丢一帧只是这 20 ms 没更新目标位置，
+# 机械臂毫无感觉；为一次抖动中止整段回放代价太大。
+MAX_CONSECUTIVE_SEND_FAIL = 6
+# 发一帧最多等多久（秒）。candle 后端默认 1.0 秒：总线上没人 ACK 时，
+# 每帧都要白等满 1 秒 —— 扫一条没接设备的死线要十几秒，回放遇到抖动也会
+# 卡满一秒。正常的电机 ACK 在微秒级，0.2 秒绰绰有余。
+CAN_SEND_TIMEOUT = 0.2
 
 REPLAY_SOFT_START_S = 0.5  # 回放前从当前姿态平滑过渡到首帧的最短时间（秒）
 APPROACH_SPEED = 0.4  # 靠近速度上限（rad/s）—— 断开重上电后姿态可能差很远，慢一点更安全
